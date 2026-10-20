@@ -3202,5 +3202,134 @@ INSTANTIATE_TEST_SUITE_P(
     SparseQuantizedFullyConnectedOpTest, SparseQuantizedFullyConnectedOpTest,
     ::testing::ValuesIn(SingleOpTest::GetKernelTags(*kKernelMap)));
 
+class UnallocatedFullyConnectedOpModel : public SingleOpModel {
+ public:
+  UnallocatedFullyConnectedOpModel(
+      TfLiteRegistration* registration, const TensorData& input,
+      const TensorData& weights, const TensorData& output,
+      bool keep_num_dims = false, const std::vector<int8_t>& raw_weights = {}) {
+    input_ = AddInput(input);
+    const int weights_id = raw_weights.empty()
+                               ? AddInput(weights)
+                               : AddConstInput(weights, raw_weights);
+    AddNullInput();
+    output_ = AddOutput(output);
+    SetBuiltinOp(
+        BuiltinOperator_FULLY_CONNECTED, BuiltinOptions_FullyConnectedOptions,
+        CreateFullyConnectedOptions(builder_, ActivationFunctionType_NONE,
+                                    FullyConnectedOptionsWeightsFormat_DEFAULT,
+                                    keep_num_dims)
+            .Union());
+    resolver_ = std::make_unique<SingleOpResolver>(
+        BuiltinOperator_FULLY_CONNECTED, registration);
+    BuildInterpreter({GetShape(input_), GetShape(weights_id)},
+                     /*num_threads=*/1, /*allow_fp32_relax_to_fp16=*/false,
+                     /*apply_delegate=*/false, /*allocate_and_delegate=*/false);
+  }
+
+  using SingleOpModel::AllocateTensors;
+  void ResizeInput(const std::vector<int>& dims) {
+    interpreter_->ResizeInputTensor(input_, dims);
+  }
+  std::vector<int> GetOutputShape() { return GetTensorShape(output_); }
+
+ private:
+  int input_;
+  int output_;
+};
+
+TEST(FullyConnectedSecurityTest, RejectsRank0InputWithKeepNumDimsInPrepare) {
+  UnallocatedFullyConnectedOpModel keep_dims_model(
+      ops::builtin::Register_FULLY_CONNECTED_REF(),
+      /*input=*/{TensorType_FLOAT32, {}},
+      /*weights=*/{TensorType_FLOAT32, {2, 1}},
+      /*output=*/{TensorType_FLOAT32},
+      /*keep_num_dims=*/true);
+  EXPECT_EQ(keep_dims_model.AllocateTensors(), kTfLiteError);
+}
+
+TEST(FullyConnectedSecurityTest,
+     RejectsRank0InputWithZeroColumnFilterInPrepare) {
+  UnallocatedFullyConnectedOpModel zero_col_filter_model(
+      ops::builtin::Register_FULLY_CONNECTED_REF(),
+      /*input=*/{TensorType_FLOAT32, {}},
+      /*weights=*/{TensorType_FLOAT32, {2, 0}},
+      /*output=*/{TensorType_FLOAT32},
+      /*keep_num_dims=*/true);
+  EXPECT_EQ(zero_col_filter_model.AllocateTensors(), kTfLiteError);
+}
+
+TEST(FullyConnectedSecurityTest,
+     RejectsHybridPerChannelInvalidQuantizedDimensionInPrepare) {
+  // 4 output units and 32 input columns, with per-channel quantization along
+  // dimension 1 (32 scales) instead of dimension 0 (4 scales).
+  std::vector<float> scales(32, 0.5f);
+  std::vector<int64_t> offsets(32, 0);
+  TensorData weights = {TensorType_INT4,
+                        /*shape=*/{4, 32},
+                        /*min=*/0.0f,
+                        /*max=*/0.0f,
+                        /*scale=*/0.0f,
+                        /*zero_point=*/0,
+                        /*per_channel_quantization=*/true,
+                        /*per_channel_quantization_scales=*/scales,
+                        /*per_channel_quantization_offsets=*/offsets,
+                        /*channel_index=*/1};
+  std::vector<int8_t> packed_weights(4 * 32 / 2, 0);
+  UnallocatedFullyConnectedOpModel m(
+      ops::builtin::Register_FULLY_CONNECTED_GENERIC_OPT(),
+      /*input=*/{TensorType_FLOAT32, {1, 32}}, weights,
+      /*output=*/{TensorType_FLOAT32},
+      /*keep_num_dims=*/false, packed_weights);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(FullyConnectedSecurityTest,
+     Int4HybridResizesOutputWhenBatchShapeChangesWithSameTotalBatchSize) {
+  TensorData weights = {TensorType_INT4,
+                        /*shape=*/{4, 32},
+                        /*min=*/-7.0f,
+                        /*max=*/7.0f,
+                        /*scale=*/1.0f,
+                        /*zero_point=*/0};
+  std::vector<int8_t> packed_weights(4 * 32 / 2, 0);
+  UnallocatedFullyConnectedOpModel m(
+      ops::builtin::Register_FULLY_CONNECTED_GENERIC_OPT(),
+      /*input=*/{TensorType_FLOAT32, {2, 3, 32}}, weights,
+      /*output=*/{TensorType_FLOAT32},
+      /*keep_num_dims=*/true, packed_weights);
+  ASSERT_EQ(m.AllocateTensors(), kTfLiteOk);
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 3, 4));
+
+  // Resize input to [3, 2, 32] (same total batch_size = 6, different shape).
+  m.ResizeInput({3, 2, 32});
+  ASSERT_EQ(m.AllocateTensors(), kTfLiteOk);
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(3, 2, 4));
+}
+
+TEST(FullyConnectedSecurityTest,
+     Int4HybridResizesOutputWhenBatchSizeBecomesZero) {
+  TensorData weights = {TensorType_INT4,
+                        /*shape=*/{4, 32},
+                        /*min=*/-7.0f,
+                        /*max=*/7.0f,
+                        /*scale=*/1.0f,
+                        /*zero_point=*/0};
+  std::vector<int8_t> packed_weights(4 * 32 / 2, 0);
+  UnallocatedFullyConnectedOpModel m(
+      ops::builtin::Register_FULLY_CONNECTED_GENERIC_OPT(),
+      /*input=*/{TensorType_FLOAT32, {2, 32}}, weights,
+      /*output=*/{TensorType_FLOAT32},
+      /*keep_num_dims=*/true, packed_weights);
+  ASSERT_EQ(m.AllocateTensors(), kTfLiteOk);
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(2, 4));
+
+  // Resize input to [0, 32] (batch_size = 0) and invoke.
+  m.ResizeInput({0, 32});
+  ASSERT_EQ(m.AllocateTensors(), kTfLiteOk);
+  EXPECT_THAT(m.GetOutputShape(), ElementsAre(0, 4));
+  EXPECT_EQ(m.Invoke(), kTfLiteOk);
+}
+
 }  // namespace
 }  // namespace tflite
