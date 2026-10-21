@@ -155,8 +155,8 @@ Value createFullyManualComputation(
     auto scalarType = RankedTensorType::get({}, globalType.getElementType());
     Value paddingVal = stablehlo::ConstantOp::create(
         builder, loc, mlir::DenseElementsAttr::get(scalarType, identityAttr));
-    manualInput = sdy::padHighSideToType(builder, loc, input, paddedGlobalType,
-                                         inSharding, paddingVal);
+    manualInput = sdy::padHighSideToType(loc, input, paddedGlobalType,
+                                         inSharding, builder, paddingVal);
   }
 
   auto op =
@@ -174,8 +174,8 @@ Value createFullyManualComputation(
       bodyPopulator(block.addArgument(localType, input.getLoc()), blockBuilder,
                     paddedGlobalType));
 
-  return sdy::sliceHighSideToType(builder, loc, op.getResult(0), globalType,
-                                  outSharding);
+  return sdy::sliceHighSideToType(loc, op.getResult(0), globalType, outSharding,
+                                  builder);
 }
 
 void convertAllReduce(sdy::AllReduceOp op, int64_t channelId,

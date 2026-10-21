@@ -1,19 +1,465 @@
-diff --git a/shardy/dialect/sdy/transforms/export/export_named_computations.cc b/shardy/dialect/sdy/transforms/export/export_named_computations.cc
-index eb441310..3285797b 100644
---- a/shardy/dialect/sdy/transforms/export/export_named_computations.cc
-+++ b/shardy/dialect/sdy/transforms/export/export_named_computations.cc
-@@ -74,9 +74,8 @@ StringAttr createFuncOp(
-   FuncOp funcOp = FuncOp::create(
-       rewriter, namedComputationOp.getLoc(), namedComputationOp.getName(),
-       rewriter.getFunctionType(namedComputationOp.getBody().getArgumentTypes(),
--                               namedComputationOp.getResultTypes()),
--      rewriter.getStringAttr("private"),
--      /*argAttrs=*/ArrayAttr(), /*resultAttrs=*/ArrayAttr());
-+                               namedComputationOp.getResultTypes()));
-+  funcOp.setPrivate();
-   funcOp->setAttr(kOriginalFuncName, namedComputationOp.getNameAttr());
+diff --git a/shardy/dialect/sdy/transforms/export/convert_global_to_local.cc b/shardy/dialect/sdy/transforms/export/convert_global_to_local.cc
+index a665d2e7..8255038b 100644
+--- a/shardy/dialect/sdy/transforms/export/convert_global_to_local.cc
++++ b/shardy/dialect/sdy/transforms/export/convert_global_to_local.cc
+@@ -122,8 +122,8 @@ struct ConversionState {
  
-   rewriter.setInsertionPointToStart(funcOp->getBlock());
+ Value getDeviceId(Location loc, const ConversionState& conversionState,
+                   ConversionPatternRewriter& rewriter) {
+-  return sdy::getDeviceId(conversionState.replicaCount,
+-                          conversionState.partitionCount, loc, rewriter);
++  return sdy::getDeviceId(loc, conversionState.replicaCount,
++                          conversionState.partitionCount, rewriter);
+ }
+ 
+ // Returns a channel handle with handle = getNextChannelId() and type = 1
+@@ -235,8 +235,9 @@ class GlobalToLocalTypeConverter : public TypeConverter {
+ };
+ 
+ Operation* createLocalGenericOp(
+-    Operation* op, ValueRange operands, ConversionPatternRewriter& rewriter,
+-    const GlobalToLocalTypeConverter* typeConverter) {
++    Operation* op, ValueRange operands,
++    const GlobalToLocalTypeConverter* typeConverter,
++    ConversionPatternRewriter& rewriter) {
+   OperationState state(op->getLoc(), op->getName());
+   state.addOperands(operands);
+   state.addTypes(typeConverter->convertResultTypes(op->getResults()));
+@@ -270,11 +271,11 @@ Operation* createLocalGenericOp(
+ // Converts op to its local version by replacing its operands with the already
+ // converted operands and removing the op from the toConvertOps list.
+ LogicalResult localizeGenericOp(Operation* op, ValueRange operands,
+-                                ConversionPatternRewriter& rewriter,
+                                 const GlobalToLocalTypeConverter* typeConverter,
+-                                ConversionState& conversionState) {
++                                ConversionState& conversionState,
++                                ConversionPatternRewriter& rewriter) {
+   Operation* newOp =
+-      createLocalGenericOp(op, operands, rewriter, typeConverter);
++      createLocalGenericOp(op, operands, typeConverter, rewriter);
+   rewriter.replaceOp(op, newOp->getResults());
+   conversionState.removeToConvertOp(op);
+   return success();
+@@ -305,9 +306,9 @@ class GenericOpPattern : public ConversionPattern {
+       return failure();
+     }
+     return localizeGenericOp(
+-        op, operands, rewriter,
++        op, operands,
+         static_cast<const GlobalToLocalTypeConverter*>(typeConverter),
+-        conversionState);
++        conversionState, rewriter);
+   }
+ 
+  private:
+@@ -335,8 +336,8 @@ class PartitioningOpInterfacePattern
+       conversionState.removeToConvertOp(op);
+       return success();
+     }
+-    return localizeGenericOp(op, operands, rewriter, converter,
+-                             conversionState);
++    return localizeGenericOp(op, operands, converter, conversionState,
++                             rewriter);
+   }
+ 
+  private:
+@@ -555,10 +556,10 @@ ValueRange createAllReduceForUnreducedAxes(
+ // Splits `combinedDim` of `input` into `factors`, transposes each factor
+ // immediately before its corresponding dimension in `targetDims`, and reshapes
+ // to merge each factor into that dimension.
+-Value distributeCombinedDimToTargetDims(Value input, int64_t combinedDim,
++Value distributeCombinedDimToTargetDims(Location loc, Value input,
++                                        int64_t combinedDim,
+                                         ArrayRef<int64_t> factors,
+                                         ArrayRef<int64_t> targetDims,
+-                                        Location loc,
+                                         ConversionPatternRewriter& rewriter) {
+   auto inputType = cast<RankedTensorType>(input.getType());
+   ArrayRef<int64_t> combinedShape = inputType.getShape();
+@@ -666,8 +667,8 @@ class AllGatherOpPattern : public OpConversionPattern<AllGatherOp> {
+         curInput, /*all_gather_dim=*/firstGatheringDim, replicaGroups,
+         channelHandle, /*use_global_device_ids=*/true);
+     curInput = distributeCombinedDimToTargetDims(
+-        allGather.getResult(0), firstGatheringDim, gatheringFactors,
+-        gatheringDims, op.getLoc(), rewriter);
++        op.getLoc(), allGather.getResult(0), firstGatheringDim,
++        gatheringFactors, gatheringDims, rewriter);
+ 
+     conversionState.removeToConvertOp(op);
+     rewriter.replaceOp(op, curInput);
+@@ -846,7 +847,7 @@ Value emitDynamicSliceForAxes(Location loc, Value globalTensor, MeshAttr mesh,
+   for (int64_t i = 0; i < localResultType.getRank(); ++i) {
+     ArrayRef<AxisRefAttr> axes = slicingAxesPerDim[i].getValue();
+     if (axes.empty()) {
+-      startIndices.push_back(createZeroConstant(rewriter, loc, indexTy));
++      startIndices.push_back(createZeroConstant(loc, indexTy, rewriter));
+       continue;
+     }
+ 
+@@ -879,7 +880,7 @@ SmallVector<Value> maskNonLeaderShards(
+       conversionState, rewriter, deviceId);
+   if (!nonLeaderVal) {
+     auto localType = cast<RankedTensorType>(inputs.front().getType());
+-    nonLeaderVal = createZeroConstant(rewriter, loc, localType);
++    nonLeaderVal = createZeroConstant(loc, localType, rewriter);
+   }
+   return llvm::map_to_vector(inputs, [&](Value input) -> Value {
+     return stablehlo::SelectOp::create(rewriter, loc, isLeader, input,
+@@ -1090,8 +1091,8 @@ class AllToAllOpPattern : public OpConversionPattern<AllToAllOp> {
+         /*split_count=*/numDevicesPerGroup, replicaGroups, channelHandle);
+ 
+     Value result = distributeCombinedDimToTargetDims(
+-        allToAll.getResult(0), minAllToAllDim, numDevicesPerParams, srcDims,
+-        loc, rewriter);
++        loc, allToAll.getResult(0), minAllToAllDim, numDevicesPerParams,
++        srcDims, rewriter);
+ 
+     rewriter.replaceOp(op, result);
+     conversionState.removeToConvertOp(op);
+@@ -1609,7 +1610,7 @@ class ShardedToUnreducedOpPattern
+     if (!localResultType.hasStaticShape()) {
+       return op.emitOpError("dynamic shape not supported");
+     }
+-    Value zeroTensor = createZeroConstant(rewriter, loc, localResultType);
++    Value zeroTensor = createZeroConstant(loc, localResultType, rewriter);
+ 
+     auto indexTy = RankedTensorType::get({}, rewriter.getI32Type());
+     Value zeroOffset;
+@@ -1619,7 +1620,7 @@ class ShardedToUnreducedOpPattern
+       ArrayRef<AxisRefAttr> axes = op.getAxes()[i].getValue();
+       if (axes.empty()) {
+         if (!zeroOffset) {
+-          zeroOffset = createZeroConstant(rewriter, loc, indexTy);
++          zeroOffset = createZeroConstant(loc, indexTy, rewriter);
+         }
+         startIndices.push_back(zeroOffset);
+         continue;
+@@ -1745,8 +1746,8 @@ class StablehloConcatenateOpPattern
+ 
+     // Since the concat dimension is replicated and others are consistent,
+     // we can safely perform a local concatenation.
+-    return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                             conversionState);
++    return localizeGenericOp(op, adaptor.getOperands(), converter,
++                             conversionState, rewriter);
+   }
+ 
+  private:
+@@ -1790,8 +1791,8 @@ class StablehloConvolutionOpPattern
+ 
+     if (isFullyReplicated(lhsSharding) && isFullyReplicated(rhsSharding) &&
+         isFullyReplicated(resultSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     MeshAttr mesh;
+@@ -1944,7 +1945,7 @@ class StablehloDotOpPattern : public OpConversionPattern<stablehlo::DotOp> {
+         if (!doesOpIntroducePartialResult(op, contractingAxes, "dot",
+                                           converter)) {
+           Operation* localDot = createLocalGenericOp(op, adaptor.getOperands(),
+-                                                     rewriter, converter);
++                                                     converter, rewriter);
+           ValueRange results = createAllReduceForUnreducedAxes(
+               op.getLoc(), localDot->getResults(), contractingAxes, mesh,
+               lhsSharding.getMeshOrRef(), enableRGV3, conversionState,
+@@ -1956,8 +1957,8 @@ class StablehloDotOpPattern : public OpConversionPattern<stablehlo::DotOp> {
+       }
+     }
+ 
+-    return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                             conversionState);
++    return localizeGenericOp(op, adaptor.getOperands(), converter,
++                             conversionState, rewriter);
+   }
+ 
+  private:
+@@ -2021,7 +2022,7 @@ class StablehloDotGeneralOpPattern
+         if (!doesOpIntroducePartialResult(op, reductionAxes, "dot_general",
+                                           converter)) {
+           Operation* localDotGeneral = createLocalGenericOp(
+-              op, adaptor.getOperands(), rewriter, converter);
++              op, adaptor.getOperands(), converter, rewriter);
+           ValueRange results = createAllReduceForUnreducedAxes(
+               op.getLoc(), localDotGeneral->getResults(), reductionAxes, mesh,
+               lhsSharding.getMeshOrRef(), enableRGV3, conversionState,
+@@ -2033,8 +2034,8 @@ class StablehloDotGeneralOpPattern
+       }
+     }
+ 
+-    return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                             conversionState);
++    return localizeGenericOp(op, adaptor.getOperands(), converter,
++                             conversionState, rewriter);
+   }
+ 
+  private:
+@@ -2059,8 +2060,8 @@ class StablehloDynamicSliceOpPattern
+     TensorShardingAttr outSharding = converter->getSharding(op.getResult());
+ 
+     if (isFullyReplicated(inSharding) && isFullyReplicated(outSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     auto globalInputType = op.getOperand().getType();
+@@ -2107,8 +2108,8 @@ class StablehloDynamicSliceOpPattern
+   ConversionState& conversionState;
+ };
+ 
+-Value createScalarInt(OpBuilder& b, Location loc, RankedTensorType type,
+-                      int64_t val) {
++Value createScalarInt(Location loc, RankedTensorType type, int64_t val,
++                      OpBuilder& b) {
+   return stablehlo::ConstantOp::create(
+       b, loc,
+       DenseIntElementsAttr::get(type,
+@@ -2124,12 +2125,12 @@ Value computeOwnershipPredicate(Location loc, Value clampedIndex, Value offset,
+                                 RankedTensorType scalarIndexType,
+                                 ConversionPatternRewriter& rewriter) {
+   Value sliceSizeConst =
+-      createScalarInt(rewriter, loc, scalarIndexType, sliceDim);
++      createScalarInt(loc, scalarIndexType, sliceDim, rewriter);
+   Value clampedPlusSlice = stablehlo::AddOp::create(
+       rewriter, loc, scalarIndexType, clampedIndex, sliceSizeConst);
+ 
+   Value shardSizeConst =
+-      createScalarInt(rewriter, loc, scalarIndexType, shardDim);
++      createScalarInt(loc, scalarIndexType, shardDim, rewriter);
+   Value offsetPlusShard = stablehlo::AddOp::create(
+       rewriter, loc, scalarIndexType, offset, shardSizeConst);
+ 
+@@ -2158,9 +2159,9 @@ LocalIndexAndOwnership computeLocalIndexAndOwnershipForDim(
+   RankedTensorType scalarIndexType = RankedTensorType::get({}, indexEltTy);
+ 
+   // Clamp the start index to [0, globalDim - sliceDim].
+-  Value zeroConst = createScalarInt(rewriter, loc, scalarIndexType, 0);
++  Value zeroConst = createScalarInt(loc, scalarIndexType, 0, rewriter);
+   Value maxConst =
+-      createScalarInt(rewriter, loc, scalarIndexType, globalDim - sliceDim);
++      createScalarInt(loc, scalarIndexType, globalDim - sliceDim, rewriter);
+   Value clampedIndex = stablehlo::ClampOp::create(
+       rewriter, loc, scalarIndexType, zeroConst, rawIndex, maxConst);
+ 
+@@ -2275,8 +2276,8 @@ class StablehloDynamicUpdateSliceOpPattern
+     TensorShardingAttr operandSharding =
+         converter->getSharding(op.getOperand());
+     if (!operandSharding || isFullyReplicated(operandSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     MeshAttr mesh = operandSharding.getMesh(converter->getSymbolTable());
+@@ -2312,8 +2313,8 @@ class StablehloDynamicUpdateSliceOpPattern
+       }
+     }
+     if (isPartitionedSliceDim.none()) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     RankedTensorType localOperandType =
+@@ -2376,7 +2377,7 @@ class StablehloReduceOpPattern
+     if (!reductionAxes.empty() &&
+         !doesOpIntroducePartialResult(op, reductionAxes, "reduce", converter)) {
+       auto localReduceOp = cast<stablehlo::ReduceOp>(
+-          createLocalGenericOp(op, adaptor.getOperands(), rewriter, converter));
++          createLocalGenericOp(op, adaptor.getOperands(), converter, rewriter));
+       if (op.getNumResults() == 1) {
+         ValueRange results = createAllReduceForUnreducedAxes(
+             op.getLoc(), localReduceOp.getResults(), localReduceOp.getBody(),
+@@ -2433,8 +2434,8 @@ class StablehloReduceOpPattern
+       return success();
+     }
+ 
+-    return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                             conversionState);
++    return localizeGenericOp(op, adaptor.getOperands(), converter,
++                             conversionState, rewriter);
+   }
+ 
+  private:
+@@ -2482,8 +2483,8 @@ std::pair<SmallVector<Value>, SmallVector<Value>> getTrivialSliceDimBounds(
+     Location loc, MeshAttr mesh, TensorShardingAttr operandSharding,
+     RankedTensorType globalOperandType, RankedTensorType localOperandType,
+     ArrayRef<int64_t> startIndexMap, ArrayRef<int64_t> trivialSliceDims,
+-    Type indexEltTy, const ConversionState& conversionState,
+-    ConversionPatternRewriter& rewriter, bool computeMask) {
++    Type indexEltTy, const ConversionState& conversionState, bool computeMask,
++    ConversionPatternRewriter& rewriter) {
+   SmallVector<Value> minBounds, maxBounds;
+   minBounds.reserve(startIndexMap.size());
+   if (computeMask) {
+@@ -2495,7 +2496,7 @@ std::pair<SmallVector<Value>, SmallVector<Value>> getTrivialSliceDimBounds(
+     if (!llvm::is_contained(trivialSliceDims, indexedDim)) {
+       // For non-trivial dims, the bounds cover the entire global range.
+       minBounds.push_back(createZeroConstant(
+-          rewriter, loc, RankedTensorType::get({}, indexEltTy)));
++          loc, RankedTensorType::get({}, indexEltTy), rewriter));
+       if (computeMask) {
+         maxBounds.push_back(stablehlo::ConstantOp::create(
+             rewriter, loc,
+@@ -2561,7 +2562,7 @@ Value clampGatherIndices(Location loc, Value indices,
+ 
+   return stablehlo::ClampOp::create(
+       rewriter, loc, indicesType,
+-      createZeroConstant(rewriter, loc, indicesType), indices,
++      createZeroConstant(loc, indicesType, rewriter), indices,
+       buildIndicesLikeTensor(globalMaxValues));
+ }
+ 
+@@ -2610,8 +2611,8 @@ std::pair<Value, Value> computeLocalIndicesAndMask(
+     }
+     auto [minBounds, maxBounds] = getTrivialSliceDimBounds(
+         loc, mesh, operandSharding, globalOperandType, localOperandType,
+-        startIndexMap, trivialSliceDims, indexEltTy, conversionState, rewriter,
+-        computeMask);
++        startIndexMap, trivialSliceDims, indexEltTy, conversionState,
++        computeMask, rewriter);
+ 
+     // Builds bounds tensors matching the indices tensor type.
+     auto buildBoundsTensor = [&](ArrayRef<Value> bounds) -> Value {
+@@ -2685,7 +2686,7 @@ std::pair<Value, Value> computeLocalIndicesAndMask(
+         int64_t shardSize = localOperandType.getDimSize(dim);
+         Value offset = getDimensionOffset(loc, mesh, axes, shardSize,
+                                           conversionState, rewriter);
+-        Value zero = createZeroConstant(rewriter, loc, offset.getType());
++        Value zero = createZeroConstant(loc, offset.getType(), rewriter);
+         Value eqZero = stablehlo::CompareOp::create(
+             rewriter, loc, offset, zero, stablehlo::ComparisonDirection::EQ);
+         partitionMask =
+@@ -2726,8 +2727,8 @@ class StablehloGatherOpPattern
+         converter->getSharding(op.getOperand());
+ 
+     if (isFullyReplicated(operandSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     MeshAttr mesh = operandSharding.getMesh(converter->getSymbolTable());
+@@ -2842,7 +2843,7 @@ class StablehloGatherOpPattern
+     // Fill the out-of-bounds positions with the reduction identity.
+     Value identityVal =
+         reductionOp == ReductionOp::SUM
+-            ? createZeroConstant(rewriter, loc, resultType)
++            ? createZeroConstant(loc, resultType, rewriter)
+             : stablehlo::ConstantOp::create(
+                   rewriter, loc,
+                   DenseElementsAttr::get(
+@@ -2963,8 +2964,8 @@ class StablehloRngBitGeneratorOpPattern
+         static_cast<const GlobalToLocalTypeConverter*>(getTypeConverter());
+     TensorShardingAttr dataSharding = converter->getSharding(op.getOutput());
+     if (!dataSharding || isFullyReplicated(dataSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     MeshAttr mesh = dataSharding.getMesh(converter->getSymbolTable());
+@@ -3023,7 +3024,7 @@ class StablehloRngBitGeneratorOpPattern
+       Value hi = stablehlo::AddOp::create(
+           rewriter, loc, x64CombineOp.getOperand(1), broadcastHash);
+       adjustedState = createLocalGenericOp(x64CombineOp, ValueRange{lo, hi},
+-                                           rewriter, converter)
++                                           converter, rewriter)
+                           ->getResult(0);
+     } else {
+       adjustedState =
+@@ -3093,8 +3094,8 @@ class StablehloPadOpPattern : public OpConversionPattern<stablehlo::PadOp> {
+       // else the pad op should have been converted to a pad followed by a
+       // collective to reshard its result.
+       SDY_CHECK(isFullyReplicated(outSharding));
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+     const SymbolTable& symbolTable = converter->getSymbolTable();
+     MeshAttr mesh = inSharding.getMesh(symbolTable);
+@@ -3310,7 +3311,7 @@ Value getScatterReductionIdentity(stablehlo::ScatterOp scatter, OpBuilder& b) {
+ 
+   return llvm::TypeSwitch<Operation*, Value>(reductionOp)
+       .Case([&](stablehlo::AddOp) {
+-        return createZeroConstant(b, loc, scalarType);
++        return createZeroConstant(loc, scalarType, b);
+       })
+       .Case([&](stablehlo::AndOp) {
+         return stablehlo::ConstantOp::create(
+@@ -3319,7 +3320,7 @@ Value getScatterReductionIdentity(stablehlo::ScatterOp scatter, OpBuilder& b) {
+                                    b.getIntegerAttr(elementType, 1)));
+       })
+       .Case([&](stablehlo::OrOp) {
+-        return createZeroConstant(b, loc, scalarType);
++        return createZeroConstant(loc, scalarType, b);
+       })
+       .Case([&](stablehlo::MulOp) {
+         if (isa<FloatType>(elementType)) {
+@@ -3381,8 +3382,8 @@ class StablehloScatterOpPattern
+     TensorShardingAttr inputSharding = converter->getSharding(input);
+     TensorShardingAttr updateSharding = converter->getSharding(update);
+     if (isFullyReplicated(inputSharding) && isFullyReplicated(updateSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     const SymbolTable& symbolTable = converter->getSymbolTable();
+@@ -3395,8 +3396,8 @@ class StablehloScatterOpPattern
+     SmallVector<AxisRefAttr> reductionAxes =
+         getScatterReductionAxes(op, updateSharding, inputSharding, mesh);
+     if (reductionAxes.empty() && isFullyReplicated(inputSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     Location loc = op.getLoc();
+@@ -3441,8 +3442,8 @@ class StablehloScatterOpPattern
+     // If no indexed dims are sharded and there is no reduction axes, just
+     // localize the types.
+     if (indexedInputDims.empty() && reductionAxes.empty()) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     // Adjust indices for sharded dimensions (Disjoint writes are parallel).
+@@ -3506,8 +3507,8 @@ class StablehloSliceOpPattern : public OpConversionPattern<stablehlo::SliceOp> {
+     TensorShardingAttr outSharding = converter->getSharding(op.getResult());
+ 
+     if (isFullyReplicated(inSharding) && isFullyReplicated(outSharding)) {
+-      return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                               conversionState);
++      return localizeGenericOp(op, adaptor.getOperands(), converter,
++                               conversionState, rewriter);
+     }
+ 
+     auto globalInputType = op.getOperand().getType();
+@@ -3650,8 +3651,8 @@ class StablehloWindowedOpPattern : public OpConversionPattern<OpTy> {
+       }
+     }
+ 
+-    return localizeGenericOp(op, adaptor.getOperands(), rewriter, converter,
+-                             conversionState);
++    return localizeGenericOp(op, adaptor.getOperands(), converter,
++                             conversionState, rewriter);
+   }
+ 
+  private:
 diff --git a/shardy/dialect/sdy/transforms/export/export_pipeline.cc b/shardy/dialect/sdy/transforms/export/export_pipeline.cc
 index 28a9534e..9be5abc6 100644
 --- a/shardy/dialect/sdy/transforms/export/export_pipeline.cc
@@ -28,6 +474,339 @@ index 28a9534e..9be5abc6 100644
    passOptions.markPartialResultWithUnreducedAxes =
        options.markPartialResultWithUnreducedAxes ||
        options.partitionerStage != PartitionerStage::kUnspecified;
+diff --git a/shardy/dialect/sdy/transforms/export/pad_for_divisibility.cc b/shardy/dialect/sdy/transforms/export/pad_for_divisibility.cc
+index 47e31742..cb9261ca 100644
+--- a/shardy/dialect/sdy/transforms/export/pad_for_divisibility.cc
++++ b/shardy/dialect/sdy/transforms/export/pad_for_divisibility.cc
+@@ -59,12 +59,12 @@ enum class PaddingValueKind { kZero, kOne };
+ constexpr PaddingValueKind kDefaultPaddingValueKind = PaddingValueKind::kZero;
+ 
+ // Returns a constant for the given PaddingValueKind.
+-Value createConstant(OpBuilder& b, Location loc, Type elementType,
+-                     PaddingValueKind kind) {
++Value createConstant(Location loc, Type elementType, PaddingValueKind kind,
++                     OpBuilder& b) {
+   auto type = RankedTensorType::get({}, elementType);
+   switch (kind) {
+     case PaddingValueKind::kZero:
+-      return createZeroConstant(b, loc, type);
++      return createZeroConstant(loc, type, b);
+     case PaddingValueKind::kOne:
+       if (auto floatType = dyn_cast<FloatType>(elementType)) {
+         return stablehlo::ConstantOp::create(
+@@ -92,51 +92,6 @@ std::optional<PaddingValueKind> getPaddingValueKind(Value paddingValue) {
+   return std::nullopt;
+ }
+ 
+-// Helper methods for commonly created ops (stablehlo.slice and stablehlo.pad).
+-
+-// Slices a tensor to `targetType` along dimensions that need trimming.
+-Value createSliceOp(OpBuilder& b, Location loc, RankedTensorType targetType,
+-                    Value input, TensorShardingAttr sharding = nullptr) {
+-  SmallVector<int64_t> starts(targetType.getRank(), 0);
+-  SmallVector<int64_t> strides(targetType.getRank(), 1);
+-  SmallVector<int64_t> limits(targetType.getShape().begin(),
+-                              targetType.getShape().end());
+-  Value sliceRes = stablehlo::SliceOp::create(b, loc, targetType, input,
+-                                              b.getDenseI64ArrayAttr(starts),
+-                                              b.getDenseI64ArrayAttr(limits),
+-                                              b.getDenseI64ArrayAttr(strides))
+-                       .getResult();
+-  if (sharding) {
+-    setSharding(sliceRes, sharding);
+-  }
+-  return sliceRes;
+-}
+-
+-// Pads a tensor to `targetType` with `paddingKind` along dimensions that need
+-// expansion.
+-Value createPadOp(OpBuilder& b, Location loc, RankedTensorType targetType,
+-                  Value input, TensorShardingAttr sharding = nullptr,
+-                  PaddingValueKind paddingKind = kDefaultPaddingValueKind) {
+-  auto inputType = cast<RankedTensorType>(input.getType());
+-  SmallVector<int64_t> edgePaddingHigh(targetType.getRank(), 0);
+-  for (int d = 0; d < targetType.getRank(); ++d) {
+-    edgePaddingHigh[d] = targetType.getDimSize(d) - inputType.getDimSize(d);
+-  }
+-  Value padding =
+-      createConstant(b, loc, targetType.getElementType(), paddingKind);
+-  SmallVector<int64_t> zeroPadding(targetType.getRank(), 0);
+-  Value padRes =
+-      stablehlo::PadOp::create(b, loc, targetType, input, padding,
+-                               b.getDenseI64ArrayAttr(zeroPadding),
+-                               b.getDenseI64ArrayAttr(edgePaddingHigh),
+-                               b.getDenseI64ArrayAttr(zeroPadding))
+-          .getResult();
+-  if (sharding) {
+-    setSharding(padRes, sharding);
+-  }
+-  return padRes;
+-}
+-
+ class PaddedTypeConverter : public TypeConverter {
+  public:
+   explicit PaddedTypeConverter(const SymbolTable& symbolTable)
+@@ -282,12 +237,14 @@ class PaddingCache {
+ 
+ // Creates a padded value for 'value' with 'paddedType' and 'paddingKind',
+ // and adds the padded value to the PaddingCache if registeredKind is present.
+-Value createPaddedValue(RankedTensorType paddedType, Value value,
++Value createPaddedValue(Value value, RankedTensorType paddedType,
+                         PaddingValueKind paddingKind,
+                         std::optional<PaddingValueKind> registeredKind,
+-                        OpBuilder& rewriter, PaddingCache& cache) {
+-  Value padOp = createPadOp(rewriter, value.getLoc(), paddedType, value,
+-                            getSharding(value), paddingKind);
++                        PaddingCache& cache, OpBuilder& rewriter) {
++  Value padding = createConstant(
++      value.getLoc(), paddedType.getElementType(), paddingKind, rewriter);
++  Value padOp = padHighSideToType(value.getLoc(), value, paddedType,
++                                  getSharding(value), rewriter, padding);
+   if (registeredKind) {
+     cache.setPadding(padOp, *registeredKind);
+   }
+@@ -333,8 +290,8 @@ SmallVector<Type> computeReconciledResultTypes(Operation* op,
+ // unless dimsToEnforce is provided, in which case only the specified
+ // dimensions are padded.
+ Value ensurePaddingWithValue(
+-    Value inputVal, RankedTensorType origType, Value padVal, OpBuilder& b,
+-    Location loc,
++    Location loc, Value inputVal, RankedTensorType origType, Value padVal,
++    OpBuilder& b,
+     std::optional<ArrayRef<int64_t>> dimsToEnforce = std::nullopt) {
+   auto paddedType = cast<RankedTensorType>(inputVal.getType());
+   if (origType == paddedType) {
+@@ -402,8 +359,8 @@ Value ensurePaddingWithValue(
+ // PaddingValueKind to determine the padding value instead of a user-provided
+ // value and may put the result into the PaddingCache.
+ Value ensurePaddingWithKind(
+-    Value inputVal, RankedTensorType origType, PaddingValueKind requiredKind,
+-    OpBuilder& b, Location loc, PaddingCache& cache,
++    Location loc, Value inputVal, RankedTensorType origType,
++    PaddingValueKind requiredKind, PaddingCache& cache, OpBuilder& b,
+     std::optional<ArrayRef<int64_t>> dimsToEnforce = std::nullopt) {
+   // Return early if no padding is applied or the cached padding already
+   // matches.
+@@ -416,9 +373,9 @@ Value ensurePaddingWithKind(
+     return inputVal;
+   }
+   Value newPaddingScalar =
+-      createConstant(b, loc, paddedType.getElementType(), requiredKind);
+-  Value select = ensurePaddingWithValue(inputVal, origType, newPaddingScalar, b,
+-                                        loc, dimsToEnforce);
++      createConstant(loc, paddedType.getElementType(), requiredKind, b);
++  Value select = ensurePaddingWithValue(loc, inputVal, origType,
++                                        newPaddingScalar, b, dimsToEnforce);
+   if (select != inputVal && !dimsToEnforce) {
+     cache.setPadding(select, requiredKind);
+   }
+@@ -429,8 +386,8 @@ Value ensurePaddingWithKind(
+ // Converts op to its local version by replacing its operands with the already
+ // converted operands.
+ LogicalResult padGenericOp(Operation* op, ValueRange operands,
+-                           ConversionPatternRewriter& rewriter,
+-                           const PaddedTypeConverter* typeConverter) {
++                           const PaddedTypeConverter* typeConverter,
++                           ConversionPatternRewriter& rewriter) {
+   // Compute padded shapes for results.
+   SmallVector<Type> inferredTypes;
+   if (auto inferTypeOp = dyn_cast<InferTypeOpInterface>(op)) {
+@@ -484,9 +441,9 @@ LogicalResult padGenericOp(Operation* op, ValueRange operands,
+ // Slices/trims `res` back to its original sizes on `trimDims`.
+ Value trimOutputForDims(Value res, Type origType, ArrayRef<int64_t> trimDims,
+                         TensorShardingAttr outSharding,
+-                        ConversionPatternRewriter& rewriter,
+                         std::optional<PaddingValueKind> paddingKind,
+-                        PaddingCache& cache) {
++                        PaddingCache& cache,
++                        ConversionPatternRewriter& rewriter) {
+   auto origRanked = dyn_cast<RankedTensorType>(origType);
+   auto newRanked = dyn_cast<RankedTensorType>(res.getType());
+   if (!origRanked || !newRanked) {
+@@ -514,7 +471,7 @@ Value trimOutputForDims(Value res, Type origType, ArrayRef<int64_t> trimDims,
+   auto targetType =
+       RankedTensorType::get(limitIndices, origRanked.getElementType());
+   Value sliceRes =
+-      createSliceOp(rewriter, res.getLoc(), targetType, res, outSharding);
++      sliceHighSideToType(res.getLoc(), res, targetType, outSharding, rewriter);
+   if (paddingKind) {
+     cache.setPadding(sliceRes, *paddingKind);
+   }
+@@ -526,8 +483,8 @@ Value trimOutputForDims(Value res, Type origType, ArrayRef<int64_t> trimDims,
+ // cache.
+ Operation* padCollectiveOp(Operation* op, Value input, Value inputOrig,
+                            RankedTensorType paddedInputType,
+-                           ConversionPatternRewriter& rewriter,
+-                           PaddingCache& cache) {
++                           PaddingCache& cache,
++                           ConversionPatternRewriter& rewriter) {
+   auto rankedInput = cast<RankedTensorType>(input.getType());
+   Value padOp = input;
+   std::optional<PaddingValueKind> paddingKind = cache.getPadding(input);
+@@ -543,8 +500,8 @@ Operation* padCollectiveOp(Operation* op, Value input, Value inputOrig,
+     } else if (paddingKind) {
+       registeredKind = paddingKind;
+     }
+-    padOp = createPaddedValue(paddedInputType, input, constantKind,
+-                              registeredKind, rewriter, cache);
++    padOp = createPaddedValue(input, paddedInputType, constantKind,
++                              registeredKind, cache, rewriter);
+     paddingKind = registeredKind;
+   }
+ 
+@@ -577,8 +534,9 @@ class GenericOpPattern : public ConversionPattern {
+         hasCustomPadHandling(op)) {
+       return failure();
+     }
+-    return padGenericOp(op, operands, rewriter,
+-                        static_cast<const PaddedTypeConverter*>(typeConverter));
++    return padGenericOp(op, operands,
++                        static_cast<const PaddedTypeConverter*>(typeConverter),
++                        rewriter);
+   }
+ };
+ 
+@@ -597,7 +555,7 @@ class PartitioningOpInterfacePattern
+             operands, rewriter, *converter, converter->getSymbolTable())) {
+       return *res;
+     }
+-    return padGenericOp(op, operands, rewriter, converter);
++    return padGenericOp(op, operands, converter, rewriter);
+   }
+ };
+ 
+@@ -728,7 +686,7 @@ class AllGatherOpPattern : public OpConversionPattern<sdy::AllGatherOp> {
+       Value res = newOp->getResult(i);
+       Value trimmed =
+           trimOutputForDims(res, op->getResult(i).getType(), trimDims,
+-                            getSharding(res), rewriter, paddingKind, cache);
++                            getSharding(res), paddingKind, cache, rewriter);
+       replacements.push_back(trimmed);
+     }
+ 
+@@ -805,7 +763,7 @@ class AllSliceOpPattern : public OpConversionPattern<sdy::AllSliceOp> {
+         getDivisiblePaddedType(rankedInputType, outSharding, symbolTable));
+ 
+     Operation* newOp =
+-        padCollectiveOp(op, input, inputOrig, paddedInputType, rewriter, cache);
++        padCollectiveOp(op, input, inputOrig, paddedInputType, cache, rewriter);
+ 
+     rewriter.replaceOp(op, newOp->getResults());
+     return success();
+@@ -841,7 +799,7 @@ class ReduceScatterOpPattern
+         getDivisiblePaddedType(rankedInputType, outSharding, symbolTable));
+ 
+     Operation* newOp =
+-        padCollectiveOp(op, input, inputOrig, paddedInputType, rewriter, cache);
++        padCollectiveOp(op, input, inputOrig, paddedInputType, cache, rewriter);
+ 
+     rewriter.replaceOp(op, newOp->getResults());
+     return success();
+@@ -887,13 +845,13 @@ class AllToAllOpPattern : public OpConversionPattern<sdy::AllToAllOp> {
+ 
+     std::optional<PaddingValueKind> paddingKind = cache.getPadding(input);
+     Operation* newOp =
+-        padCollectiveOp(op, input, inputOrig, paddedInputType, rewriter, cache);
++        padCollectiveOp(op, input, inputOrig, paddedInputType, cache, rewriter);
+ 
+     Value res = newOp->getResult(0);
+ 
+     SmallVector<int64_t> trimDims = getTrimDims(op);
+     res = trimOutputForDims(res, inputOrig.getType(), trimDims, outSharding,
+-                            rewriter, paddingKind, cache);
++                            paddingKind, cache, rewriter);
+ 
+     rewriter.replaceOp(op, {res});
+     return success();
+@@ -926,7 +884,7 @@ class StablehloReshapeOpPattern
+           "should have been resolved by resolve-permutation-factors.");
+     }
+ 
+-    return padGenericOp(op, adaptor.getOperands(), rewriter, converter);
++    return padGenericOp(op, adaptor.getOperands(), converter, rewriter);
+   }
+ };
+ 
+@@ -946,7 +904,7 @@ class StablehloSliceOpPattern : public OpConversionPattern<stablehlo::SliceOp> {
+         resultType, sharding, converter->getSymbolTable()));
+ 
+     if (paddedType == resultType) {
+-      return padGenericOp(op, adaptor.getOperands(), rewriter, converter);
++      return padGenericOp(op, adaptor.getOperands(), converter, rewriter);
+     }
+ 
+     ArrayRef<int64_t> paddedShape = paddedType.getShape();
+@@ -1037,9 +995,9 @@ class StablehloPadOpPattern : public OpConversionPattern<stablehlo::PadOp> {
+       // When high padding is reduced, the input's padding region takes the
+       // place of the trailing padding value for the pad op. As such, we need
+       // to ensure the input is padded with the correct value.
+-      input = ensurePaddingWithValue(input, op.getOperand().getType(),
+-                                     adaptor.getOperands()[1], rewriter,
+-                                     op.getLoc());
++      input = ensurePaddingWithValue(op.getLoc(), input,
++                                     op.getOperand().getType(),
++                                     adaptor.getOperands()[1], rewriter);
+     }
+ 
+     auto newHighAttr = rewriter.getDenseI64ArrayAttr(newHigh);
+@@ -1094,13 +1052,13 @@ class StablehloDotGeneralOpPattern
+       return failure();
+     }
+     Value paddedLhs = ensurePaddingWithKind(
+-        lhs, lhsOrigType, PaddingValueKind::kZero, rewriter, loc, cache,
++        loc, lhs, lhsOrigType, PaddingValueKind::kZero, cache, rewriter,
+         dimNums.getLhsContractingDimensions());
+     Value paddedRhs = ensurePaddingWithKind(
+-        rhs, rhsOrigType, PaddingValueKind::kZero, rewriter, loc, cache,
++        loc, rhs, rhsOrigType, PaddingValueKind::kZero, cache, rewriter,
+         dimNums.getRhsContractingDimensions());
+ 
+-    return padGenericOp(op, {paddedLhs, paddedRhs}, rewriter, converter);
++    return padGenericOp(op, {paddedLhs, paddedRhs}, converter, rewriter);
+   }
+ 
+  private:
+@@ -1144,11 +1102,11 @@ class StablehloConvolutionOpPattern
+     // pass-through dimensions (like batch or kernel output feature) which are
+     // left out of lhsEnforceDims and rhsEnforceDims.
+     Value paddedLhs =
+-        ensurePaddingWithKind(lhs, lhsOrigType, PaddingValueKind::kZero,
+-                              rewriter, loc, cache, lhsEnforceDims);
++        ensurePaddingWithKind(loc, lhs, lhsOrigType, PaddingValueKind::kZero,
++                              cache, rewriter, lhsEnforceDims);
+     Value paddedRhs =
+-        ensurePaddingWithKind(rhs, rhsOrigType, PaddingValueKind::kZero,
+-                              rewriter, loc, cache, rhsEnforceDims);
++        ensurePaddingWithKind(loc, rhs, rhsOrigType, PaddingValueKind::kZero,
++                              cache, rewriter, rhsEnforceDims);
+ 
+     int64_t newFeatureGroupCount = op.getFeatureGroupCount();
+     int64_t origInputFeatureSize =
+@@ -1257,7 +1215,7 @@ class StablehloConvolutionOpPattern
+     Value finalResult =
+         trimOutputForDims(newOp->getResult(0), paddedResultShaped,
+                           dimNums.getOutputSpatialDimensions(), outSharding,
+-                          rewriter, PaddingValueKind::kZero, cache);
++                          PaddingValueKind::kZero, cache, rewriter);
+ 
+     rewriter.replaceOp(op, finalResult);
+     return success();
+@@ -1416,13 +1374,13 @@ class StablehloReduceOpPattern
+         allOperands.push_back(input);
+       } else {
+         allOperands.push_back(ensurePaddingWithValue(
+-            input, origType, initVal, rewriter, loc, op.getDimensions()));
++            loc, input, origType, initVal, rewriter, op.getDimensions()));
+       }
+     }
+     allOperands.append(adaptor.getInitValues().begin(),
+                        adaptor.getInitValues().end());
+ 
+-    return padGenericOp(op, allOperands, rewriter, converter);
++    return padGenericOp(op, allOperands, converter, rewriter);
+   }
+ 
+  private:
 diff --git a/shardy/dialect/sdy/transforms/export/passes.td b/shardy/dialect/sdy/transforms/export/passes.td
 index de4db467..9fe5f023 100644
 --- a/shardy/dialect/sdy/transforms/export/passes.td
@@ -48,23 +827,262 @@ index de4db467..9fe5f023 100644
        Option<"markPartialResultWithUnreducedAxes",
               "mark-partial-result-with-unreduced-axes",
 diff --git a/shardy/dialect/sdy/transforms/export/per_instruction_partitioning.cc b/shardy/dialect/sdy/transforms/export/per_instruction_partitioning.cc
-index 059cd1e8..ce34913e 100644
+index ce34913e..c9d2eccb 100644
 --- a/shardy/dialect/sdy/transforms/export/per_instruction_partitioning.cc
 +++ b/shardy/dialect/sdy/transforms/export/per_instruction_partitioning.cc
-@@ -503,10 +503,9 @@ LogicalResult outlineInstruction(Operation* op,
-   FunctionType funcType =
-       FunctionType::get(ctx, paddedArgTypes, paddedResultTypes);
+@@ -470,7 +470,7 @@ SmallVector<Value> padIndivisibleLiveInValues(
+   for (auto [operand, paddedType, sharding] : llvm::zip_equal(
+            liveInValues, paddedArgTypes, shardingInfo.inShardings)) {
+     manualOperands.push_back(padHighSideToType(
+-        rewriter, op->getLoc(), operand, paddedType, sharding,
++        op->getLoc(), operand, paddedType, sharding, rewriter,
+         /*paddingValue=*/nullptr, /*allowSlicePeephole=*/true));
+   }
+   return manualOperands;
+@@ -561,8 +561,8 @@ LogicalResult outlineInstruction(Operation* op,
+     Value arg = block->getArgument(argIdx);
+     TensorShardingAttr operandSharding = shardingInfo.inShardings[argIdx];
+     if (!isReshard && arg.getType() != origType) {
+-      arg = sliceHighSideToType(tempRewriter, op->getLoc(), arg, origType,
+-                                operandSharding);
++      arg = sliceHighSideToType(op->getLoc(), arg, origType, operandSharding,
++                                tempRewriter);
+     }
+     if (auto concatOp = dyn_cast<stablehlo::ConcatenateOp>(op)) {
+       int64_t concatDim = concatOp.getDimension();
+@@ -652,8 +652,8 @@ LogicalResult outlineInstruction(Operation* op,
+     Value res = clonedAllReduce.getResult();
+     Type targetType = paddedResultTypes[0];
+     if (res.getType() != targetType) {
+-      res = padHighSideToType(tempRewriter, op->getLoc(), res, targetType,
+-                              shardingInfo.outShardings[0]);
++      res = padHighSideToType(op->getLoc(), res, targetType,
++                              shardingInfo.outShardings[0], tempRewriter);
+     }
+     func::ReturnOp::create(tempRewriter, op->getLoc(), ValueRange{res});
+     return success();
+@@ -670,9 +670,9 @@ LogicalResult outlineInstruction(Operation* op,
+     }
+     Type targetType = paddedResultTypes[i];
+     if (res.getType() != targetType) {
+-      returnValues.push_back(padHighSideToType(tempRewriter, op->getLoc(), res,
+-                                               targetType,
+-                                               shardingInfo.outShardings[i]));
++      returnValues.push_back(padHighSideToType(op->getLoc(), res, targetType,
++                                               shardingInfo.outShardings[i],
++                                               tempRewriter));
+     } else {
+       returnValues.push_back(res);
+     }
+@@ -734,8 +734,8 @@ void sliceIndivisibleResults(Operation* op, ManualComputationOp manualCompOp,
+     Value origRes = op->getResult(j);
+     Value manualRes = manualCompOp.getResult(j);
+     Type origResType = origRes.getType();
+-    Value slicedRes = sliceHighSideToType(rewriter, op->getLoc(), manualRes,
+-                                          origResType, outShardings[j]);
++    Value slicedRes = sliceHighSideToType(op->getLoc(), manualRes, origResType,
++                                          outShardings[j], rewriter);
+     rewriter.replaceAllUsesWith(origRes, slicedRes);
+   }
+ }
+diff --git a/shardy/dialect/sdy/transforms/export/resolve_permutation_factors.cc b/shardy/dialect/sdy/transforms/export/resolve_permutation_factors.cc
+index 107fce53..d11e3ad8 100644
+--- a/shardy/dialect/sdy/transforms/export/resolve_permutation_factors.cc
++++ b/shardy/dialect/sdy/transforms/export/resolve_permutation_factors.cc
+@@ -256,7 +256,7 @@ int64_t getMeshAxisIndex(ArrayRef<MeshAxisAttr> axes, StringRef name) {
+ }
  
--  outlinedFunc = func::FuncOp::create(
--      tempRewriter, op->getLoc(), "outlined_op", funcType,
--      tempRewriter.getStringAttr("private"),
--      /*argAttrs=*/ArrayAttr(), /*resultAttrs=*/ArrayAttr());
-+  outlinedFunc =
-+      func::FuncOp::create(tempRewriter, op->getLoc(), "outlined_op", funcType);
-+  outlinedFunc.setPrivate();
+ Value createDeviceId(Location loc, ResolutionState& state) {
+-  return getDeviceId(state.replicaCount, state.partitionCount, loc,
++  return getDeviceId(loc, state.replicaCount, state.partitionCount,
+                      state.rewriter);
+ }
  
-   for (size_t i = 0; i < shardingInfo.inShardings.size(); ++i) {
-     if (shardingInfo.inShardings[i]) {
+@@ -427,7 +427,7 @@ DeviceOffsetInfo getDeviceOffsetInfo(Location loc, Value partitionId,
+       stablehlo::AddOp::create(rewriter, loc, offsetInPartition, baseOffsetVal);
+ 
+   auto zeroConst =
+-      createZeroConstant(rewriter, loc, RankedTensorType::get({}, i32Ty));
++      createZeroConstant(loc, RankedTensorType::get({}, i32Ty), rewriter);
+ 
+   dilatedOffset =
+       stablehlo::MaxOp::create(rewriter, loc, dilatedOffset, zeroConst);
+@@ -607,25 +607,25 @@ inline int64_t getPaddedDimSize(int64_t dimSize, int64_t shardCount) {
+ }
+ 
+ // Creates a zero scalar constant of element type `elemType`.
+-inline Value createZeroScalarConstant(Location loc, IRRewriter& rewriter,
+-                                      Type elemType) {
+-  return createZeroConstant(rewriter, loc, RankedTensorType::get({}, elemType));
++inline Value createZeroScalarConstant(Location loc, Type elemType,
++                                      IRRewriter& rewriter) {
++  return createZeroConstant(loc, RankedTensorType::get({}, elemType), rewriter);
+ }
+ 
+ // Pads the high side of `operand` with `paddingValue` (default zero if null)
+ // to match the target `paddedShape`. When used to align dimensions for the
+ // input sharding's own divisibility, the created pad op is a
+ // communication-free operation.
+-Value padHighSideToShape(Location loc, IRRewriter& rewriter, Value operand,
++Value padHighSideToShape(Location loc, Value operand,
+                          ArrayRef<int64_t> paddedShape,
+-                         TensorShardingAttr sharding,
++                         TensorShardingAttr sharding, IRRewriter& rewriter,
+                          Value paddingValue = nullptr) {
+   auto type = cast<RankedTensorType>(operand.getType());
+   if (paddedShape == type.getShape()) {
+     return operand;
+   }
+   auto paddedType = RankedTensorType::get(paddedShape, type.getElementType());
+-  return padHighSideToType(rewriter, loc, operand, paddedType, sharding,
++  return padHighSideToType(loc, operand, paddedType, sharding, rewriter,
+                            paddingValue);
+ }
+ 
+@@ -714,8 +714,8 @@ Value rightShiftData(Location loc, Value input, int64_t dim, int64_t totalShift,
+     SmallVector<int64_t> pairs =
+         getDataShiftSourceTargetPairs(mesh, manualAxesInDim, deviceOffset);
+     if (pairs.empty()) {
+-      Value zeroConst = createZeroScalarConstant(loc, state.rewriter,
+-                                                 inputType.getElementType());
++      Value zeroConst = createZeroScalarConstant(
++          loc, inputType.getElementType(), state.rewriter);
+       auto bcast = stablehlo::BroadcastInDimOp::create(
+           state.rewriter, loc, cast<RankedTensorType>(piece.getType()),
+           zeroConst, state.rewriter.getDenseI64ArrayAttr({}));
+@@ -1056,8 +1056,8 @@ Value exchangeDimWithDynamicOffset(
+         idInPartitionGroup, state.rewriter.getDenseI64ArrayAttr({1}));
+     offset = stablehlo::ReshapeOp::create(
+         state.rewriter, loc, RankedTensorType::get({}, i32Ty), sliceOp);
+-    zeroConst = createZeroConstant(state.rewriter, loc,
+-                                   RankedTensorType::get({}, i32Ty));
++    zeroConst = createZeroConstant(loc, RankedTensorType::get({}, i32Ty),
++                                   state.rewriter);
+   } else {
+     DeviceOffsetInfo offsetInfo =
+         getDeviceOffsetInfo(loc, idInPartitionGroup, diffSize,
+@@ -1430,8 +1430,8 @@ LogicalResult handlePadOp(stablehlo::PadOp padOp, ResolutionState& state) {
+   rewriter.setInsertionPoint(padOp);
+   // Align logical shard sizes via high-side padding (Comm-free).
+   Value divisibleInput =
+-      padHighSideToShape(loc, rewriter, origInput, info.divisibleInputShape,
+-                         inSharding, padOp.getPaddingValue());
++      padHighSideToShape(loc, origInput, info.divisibleInputShape, inSharding,
++                         rewriter, padOp.getPaddingValue());
+ 
+   SmallVector<int64_t> baseDilations = llvm::map_to_vector(
+       padOp.getInteriorPadding(), [](int64_t val) { return val + 1; });
+@@ -1455,7 +1455,7 @@ LogicalResult handlePadOp(stablehlo::PadOp padOp, ResolutionState& state) {
+ 
+   // Trim final tensor shape to match expected output shape.
+   result =
+-      sliceHighSideToType(rewriter, loc, result, padOp.getType(), inSharding);
++      sliceHighSideToType(loc, result, padOp.getType(), inSharding, rewriter);
+ 
+   rewriter.replaceOp(padOp, result);
+   return success();
+@@ -1832,12 +1832,12 @@ LogicalResult handleReshapeHaloExchange(
+   IRRewriter& rewriter = state.rewriter;
+   rewriter.setInsertionPoint(reshapeOp);
+   Value paddingValue =
+-      createZeroScalarConstant(loc, rewriter, resultType.getElementType());
++      createZeroScalarConstant(loc, resultType.getElementType(), rewriter);
+   Value operand = reshapeOp.getOperand();
+   auto origInputType = cast<RankedTensorType>(operand.getType());
+   SmallVector<int64_t> edgePaddingLow(origInputType.getRank(), 0);
+-  Value paddedInput = padHighSideToShape(loc, rewriter, operand,
+-                                         divisibleInputShape, inSharding);
++  Value paddedInput = padHighSideToShape(loc, operand, divisibleInputShape,
++                                         inSharding, rewriter);
+ 
+   auto postProcess = [&](Value exchangedLocal, Value localPaddingValue,
+                          RankedTensorType paddedGlobalResultType,
+@@ -1864,7 +1864,7 @@ LogicalResult handleReshapeHaloExchange(
+       loc, paddedInput, divisibleInputShape, origInputType, resultType,
+       inSharding, outSharding, mesh, info.manualAxes, paddingValue,
+       edgePaddingLow, info.dimExchanges, postProcess, state);
+-  result = sliceHighSideToType(rewriter, loc, result, resultType, outSharding);
++  result = sliceHighSideToType(loc, result, resultType, outSharding, rewriter);
+   rewriter.replaceOp(reshapeOp, result);
+   return success();
+ }
+@@ -2014,8 +2014,8 @@ LogicalResult handleReverseOp(stablehlo::ReverseOp reverseOp,
+   // Pad indivisible dimensions on the high edge.
+   if (!info->manualAxes.empty()) {
+     state.rewriter.setInsertionPoint(reverseOp);
+-    input = padHighSideToShape(loc, state.rewriter, operand, info->paddedShape,
+-                               inSharding);
++    input = padHighSideToShape(loc, operand, info->paddedShape, inSharding,
++                               state.rewriter);
+ 
+     SmallVector<int64_t> dimsToShift, shiftAmounts;
+     int64_t rank = origType.getRank();
+@@ -2061,8 +2061,8 @@ LogicalResult handleReverseOp(stablehlo::ReverseOp reverseOp,
+ 
+   // Trim off the padding.
+   if (!info->manualAxes.empty()) {
+-    Value slicedResult = sliceHighSideToType(
+-        state.rewriter, loc, reversedResult, origType, inSharding);
++    Value slicedResult = sliceHighSideToType(loc, reversedResult, origType,
++                                             inSharding, state.rewriter);
+     state.rewriter.replaceAllUsesExcept(reverseOp.getResult(), slicedResult,
+                                         reversedResult.getDefiningOp());
+   } else {
+@@ -2208,11 +2208,11 @@ LogicalResult handleSliceOp(stablehlo::SliceOp sliceOp,
+   rewriter.setInsertionPoint(sliceOp);
+   // Align logical shard sizes via high-side padding.
+   Value divisibleInput =
+-      padHighSideToShape(loc, rewriter, origInput, info.divisibleInputShape,
+-                         inSharding, /*paddingValue=*/nullptr);
++      padHighSideToShape(loc, origInput, info.divisibleInputShape, inSharding,
++                         rewriter, /*paddingValue=*/nullptr);
+ 
+   Value paddingValue =
+-      createZeroScalarConstant(loc, rewriter, origInputType.getElementType());
++      createZeroScalarConstant(loc, origInputType.getElementType(), rewriter);
+ 
+   int64_t rank = origInputType.getRank();
+   SmallVector<int64_t> edgePaddingLow, edgePaddingHigh, interiorPadding;
+@@ -2245,7 +2245,7 @@ LogicalResult handleSliceOp(stablehlo::SliceOp sliceOp,
+ 
+   // Trim final tensor shape to match expected output shape.
+   result =
+-      sliceHighSideToType(rewriter, loc, result, sliceOp.getType(), inSharding);
++      sliceHighSideToType(loc, result, sliceOp.getType(), inSharding, rewriter);
+ 
+   rewriter.replaceOp(sliceOp, result);
+   return success();
+diff --git a/shardy/dialect/sdy/transforms/export/resolve_single_device_sharding.cc b/shardy/dialect/sdy/transforms/export/resolve_single_device_sharding.cc
+index cdce7d73..76727deb 100644
+--- a/shardy/dialect/sdy/transforms/export/resolve_single_device_sharding.cc
++++ b/shardy/dialect/sdy/transforms/export/resolve_single_device_sharding.cc
+@@ -101,7 +101,7 @@ Value createDeviceGuard(Location loc, int64_t targetDeviceId,
+                         int64_t replicaCount, int64_t partitionCount,
+                         IRRewriter& rewriter) {
+   Value currentDeviceId =
+-      getDeviceId(replicaCount, partitionCount, loc, rewriter);
++      getDeviceId(loc, replicaCount, partitionCount, rewriter);
+   auto scalarUI32Type = RankedTensorType::get(
+       {}, rewriter.getIntegerType(32, /*isSigned=*/false));
+   SDY_CHECK_GE(targetDeviceId, 0);
+@@ -157,7 +157,7 @@ void resolveSingleDeviceOp(Operation* op, const SymbolTable& symbolTable,
+         isTargetDevice = createDeviceGuard(loc, *targetDeviceId, replicaCount,
+                                            partitionCount, rewriter);
+       }
+-      Value zeroConst = createZeroConstant(rewriter, loc, rankedType);
++      Value zeroConst = createZeroConstant(loc, rankedType, rewriter);
+       maskedResults.push_back(stablehlo::SelectOp::create(
+           rewriter, loc, rankedType, isTargetDevice, result, zeroConst));
+     }
+@@ -186,7 +186,7 @@ void resolveSingleDeviceOp(Operation* op, const SymbolTable& symbolTable,
+     SmallVector<Value> falseZeros;
+     for (Type type : resultTypes) {
+       if (auto rankedType = dyn_cast<RankedTensorType>(type)) {
+-        Value zeroConst = createZeroConstant(rewriter, loc, rankedType);
++        Value zeroConst = createZeroConstant(loc, rankedType, rewriter);
+         falseZeros.push_back(zeroConst);
+       } else if (isa<stablehlo::TokenType>(type)) {
+         Value tokenConst = stablehlo::CreateTokenOp::create(rewriter, loc);
 diff --git a/shardy/dialect/sdy/transforms/export/test/export_pipeline.mlir b/shardy/dialect/sdy/transforms/export/test/export_pipeline.mlir
 index d72ae963..6ce4f38b 100644
 --- a/shardy/dialect/sdy/transforms/export/test/export_pipeline.mlir
@@ -136,6 +1154,120 @@ index d72ae963..6ce4f38b 100644
    %0 = sdy.propagation_barrier %arg0 allowed_direction=BACKWARD {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{}, {"b"}]>]>} : tensor<8x8xf32>
    %1 = stablehlo.add %0, %0 {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{}, {"b"}]>]>} : tensor<8x8xf32>
    return %1 : tensor<8x8xf32>
+diff --git a/shardy/dialect/sdy/transforms/export/utils.cc b/shardy/dialect/sdy/transforms/export/utils.cc
+index 54e5d6f3..1323f0b1 100644
+--- a/shardy/dialect/sdy/transforms/export/utils.cc
++++ b/shardy/dialect/sdy/transforms/export/utils.cc
+@@ -284,7 +284,7 @@ bool usePartitionId(int64_t replicaCount, int64_t partitionCount) {
+   return replicaCount == 1;
+ }
+ 
+-Value getDeviceId(int64_t replicaCount, int64_t partitionCount, Location loc,
++Value getDeviceId(Location loc, int64_t replicaCount, int64_t partitionCount,
+                   OpBuilder& rewriter) {
+   if (usePartitionId(replicaCount, partitionCount)) {
+     return stablehlo::PartitionIdOp::create(rewriter, loc);
+@@ -627,8 +627,8 @@ bool isCommunicationFreeReshape(stablehlo::ReshapeOp reshapeOp,
+                                     inputType, outputType, groups);
+ }
+ 
+-Value sliceHighSideToType(OpBuilder& builder, Location loc, Value operand,
+-                          Type targetType, TensorShardingAttr sharding) {
++Value sliceHighSideToType(Location loc, Value operand, Type targetType,
++                          TensorShardingAttr sharding, OpBuilder& builder) {
+   Type currentType = operand.getType();
+   if (currentType == targetType) {
+     return operand;
+@@ -648,7 +648,7 @@ Value sliceHighSideToType(OpBuilder& builder, Location loc, Value operand,
+   return sliced;
+ }
+ 
+-Attribute getZeroAttr(OpBuilder& builder, Type type) {
++Attribute getZeroAttr(Type type, OpBuilder& builder) {
+   if (Attribute attr = builder.getZeroAttr(type)) {
+     return attr;
+   }
+@@ -674,14 +674,14 @@ Attribute getZeroAttr(OpBuilder& builder, Type type) {
+   return nullptr;
+ }
+ 
+-Value createZeroConstant(OpBuilder& builder, Location loc, Type type) {
+-  Attribute zeroAttr = getZeroAttr(builder, type);
++Value createZeroConstant(Location loc, Type type, OpBuilder& builder) {
++  Attribute zeroAttr = getZeroAttr(type, builder);
+   SDY_CHECK(zeroAttr) << "Failed to create zero attribute";
+   return stablehlo::ConstantOp::create(builder, loc, zeroAttr);
+ }
+ 
+-Value padHighSideToType(OpBuilder& builder, Location loc, Value operand,
+-                        Type targetType, TensorShardingAttr sharding,
++Value padHighSideToType(Location loc, Value operand, Type targetType,
++                        TensorShardingAttr sharding, OpBuilder& builder,
+                         Value paddingValue, bool allowSlicePeephole) {
+   Type currentType = operand.getType();
+   if (currentType == targetType) {
+@@ -710,7 +710,7 @@ Value padHighSideToType(OpBuilder& builder, Location loc, Value operand,
+   Value padVal = paddingValue;
+   if (!padVal) {
+     auto zeroType = RankedTensorType::get({}, targetRanked.getElementType());
+-    padVal = createZeroConstant(builder, loc, zeroType);
++    padVal = createZeroConstant(loc, zeroType, builder);
+   }
+   Value padded = stablehlo::PadOp::create(
+       builder, loc, targetRanked, operand, padVal,
+@@ -815,7 +815,7 @@ ElementsAttr padElementsAttr(ElementsAttr elementsAttr,
+ 
+   OpBuilder builder(paddedType.getContext());
+   auto zeroDenseAttr =
+-      dyn_cast_or_null<DenseElementsAttr>(getZeroAttr(builder, paddedType));
++      dyn_cast_or_null<DenseElementsAttr>(getZeroAttr(paddedType, builder));
+   SDY_CHECK(zeroDenseAttr) << "Failed to create zero attribute";
+ 
+   int64_t rank = origType.getRank();
+diff --git a/shardy/dialect/sdy/transforms/export/utils.h b/shardy/dialect/sdy/transforms/export/utils.h
+index 5737504e..db2513b1 100644
+--- a/shardy/dialect/sdy/transforms/export/utils.h
++++ b/shardy/dialect/sdy/transforms/export/utils.h
+@@ -117,7 +117,7 @@ bool usePartitionId(int64_t replicaCount, int64_t partitionCount);
+ // partition count.
+ //
+ // TODO(b/545097355): support replica_count > 1 && partition_count > 1.
+-Value getDeviceId(int64_t replicaCount, int64_t partitionCount, Location loc,
++Value getDeviceId(Location loc, int64_t replicaCount, int64_t partitionCount,
+                   OpBuilder& rewriter);
+ 
+ // Returns a channel handle with handle = nextChannelId++ and type = 1
+@@ -252,24 +252,23 @@ bool isCommunicationFreeReshape(stablehlo::ReshapeOp reshapeOp,
+ // Slices the high side of `operand` starting at zero with unit strides to match
+ // `targetType`. If `operand` already matches `targetType`, returns `operand`.
+ // Attaches `sharding` to the created slice op if non-null.
+-Value sliceHighSideToType(OpBuilder& builder, Location loc, Value operand,
+-                          Type targetType,
+-                          TensorShardingAttr sharding = nullptr);
++Value sliceHighSideToType(Location loc, Value operand, Type targetType,
++                          TensorShardingAttr sharding, OpBuilder& builder);
+ 
+ // Returns a zero attribute for any ShapedType or scalar Type, including real
+ // integer, real float, and all ComplexType elements (complex<f32>,
+ // complex<bf16>, etc.).
+-Attribute getZeroAttr(OpBuilder& builder, Type type);
++Attribute getZeroAttr(Type type, OpBuilder& builder);
+ 
+ // Creates a stablehlo.constant zero matching `type` (scalar or tensor, real or
+ // complex).
+-Value createZeroConstant(OpBuilder& builder, Location loc, Type type);
++Value createZeroConstant(Location loc, Type type, OpBuilder& builder);
+ 
+ // Zero-pads the high side of `operand` to match `targetType`. If `operand`
+ // already matches `targetType`, returns `operand`. Attaches `sharding` to the
+ // created pad op if non-null.
+-Value padHighSideToType(OpBuilder& builder, Location loc, Value operand,
+-                        Type targetType, TensorShardingAttr sharding = nullptr,
++Value padHighSideToType(Location loc, Value operand, Type targetType,
++                        TensorShardingAttr sharding, OpBuilder& builder,
+                         Value paddingValue = nullptr,
+                         bool allowSlicePeephole = false);
+ 
 diff --git a/shardy/dialect/sdy/transforms/propagation/test/propagation_pipeline.mlir b/shardy/dialect/sdy/transforms/propagation/test/propagation_pipeline.mlir
 index 4119f39c..33c7ae02 100644
 --- a/shardy/dialect/sdy/transforms/propagation/test/propagation_pipeline.mlir
@@ -370,955 +1502,3 @@ index 2286a0d0..b1f17674 100644
    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}, {"b", ?}]> : tensor<8x8xf32>
    sdy.sharding_group %0 group_id=1183 : tensor<8x8xf32>
    %1 = sdy.sharding_constraint %arg0 <@mesh, [{"a"}, {?}]> : tensor<8x8xf32>
-diff --git a/third_party/llvm/generated.patch b/third_party/llvm/generated.patch
-index 509398da..6e5b2265 100644
---- a/third_party/llvm/generated.patch
-+++ b/third_party/llvm/generated.patch
-@@ -1 +1,638 @@
- Auto generated patch. Do not edit or delete it, even if empty.
-+diff -ruN --strip-trailing-cr a/mlir/docs/BytecodeFormat.md b/mlir/docs/BytecodeFormat.md
-+--- a/mlir/docs/BytecodeFormat.md
-++++ b/mlir/docs/BytecodeFormat.md
-+@@ -21,6 +21,18 @@
-+ There is no restriction on what kind of information a dialect
-+ is allowed to encode to model its versioning.
-+ 
-++When emitting bytecode, `mlir-opt --emit-bytecode-version=<version>` selects the
-++overall bytecode format version. Dialect versions are selected separately with
-++`--emit-bytecode-dialect-version=<dialect>=<version>`, which may be repeated for
-++different dialects. For example, `mlir-opt --emit-bytecode
-++--emit-bytecode-dialect-version=builtin=0` selects the historical builtin dialect
-++encoding. A dialect must implement `BytecodeDialectInterface::parseVersion` to
-++accept a version string; the dialect defines its syntax and supported versions.
-++The resulting version object is passed to the bytecode writer through
-++`BytecodeWriterConfig::setDialectVersion`. Before emission, the writer invokes
-++`BytecodeDialectInterface::verifyVersion` for explicitly selected versions so
-++dialects can reject IR that cannot be represented without losing information.
-++
-+ [TOC]
-+ 
-+ ## Magic Number
-+diff -ruN --strip-trailing-cr a/mlir/include/mlir/Bytecode/BytecodeDialectInterface.td b/mlir/include/mlir/Bytecode/BytecodeDialectInterface.td
-+--- a/mlir/include/mlir/Bytecode/BytecodeDialectInterface.td
-++++ b/mlir/include/mlir/Bytecode/BytecodeDialectInterface.td
-+@@ -58,6 +58,27 @@
-+       }]
-+     >,
-+     InterfaceMethod<[{
-++        Parse a target dialect version for bytecode emission from a string, for
-++        example from a command-line option. Return null if the version is invalid
-++        or unsupported. The dialect defines the syntax of the version string.
-++      }],
-++      "std::unique_ptr<::mlir::DialectVersion>", "parseVersion",
-++      (ins "::llvm::StringRef":$version),
-++      [{ return nullptr; }]
-++    >,
-++    InterfaceMethod<[{
-++        Verify that the given operation and its nested IR can be emitted for the
-++        requested dialect version without losing information. This hook is
-++        invoked before bytecode emission when a target version is explicitly
-++        configured. Emit a diagnostic and return failure if the IR cannot be
-++        represented in that version.
-++      }],
-++      "::llvm::LogicalResult", "verifyVersion",
-++      (ins "::mlir::Operation *":$topLevelOp,
-++           "const ::mlir::DialectVersion &":$version),
-++      [{ return ::llvm::success(); }]
-++    >,
-++    InterfaceMethod<[{
-+         Write the version of this dialect to the given writer.
-+       }],
-+       "void", "writeVersion",
-+diff -ruN --strip-trailing-cr a/mlir/include/mlir/Tools/mlir-opt/MlirOptMain.h b/mlir/include/mlir/Tools/mlir-opt/MlirOptMain.h
-+--- a/mlir/include/mlir/Tools/mlir-opt/MlirOptMain.h
-++++ b/mlir/include/mlir/Tools/mlir-opt/MlirOptMain.h
-+@@ -15,6 +15,7 @@
-+ 
-+ #include "mlir/Debug/CLOptionsSetup.h"
-+ #include "mlir/Support/ToolUtilities.h"
-++#include "llvm/ADT/ArrayRef.h"
-+ #include "llvm/ADT/StringRef.h"
-+ 
-+ #include <cstdlib>
-+@@ -128,6 +129,17 @@
-+     return emitBytecodeVersion;
-+   }
-+ 
-++  /// Set target dialect versions as strings of the form "dialect=version".
-++  /// The dialect defines the syntax of its version string.
-++  MlirOptMainConfig &
-++  setEmitBytecodeDialectVersions(ArrayRef<std::string> versions) {
-++    emitBytecodeDialectVersions.assign(versions.begin(), versions.end());
-++    return *this;
-++  }
-++  ArrayRef<std::string> bytecodeDialectVersionsToEmit() const {
-++    return emitBytecodeDialectVersions;
-++  }
-++
-+   /// Set the bytecode producer to use.
-+   MlirOptMainConfig &emitBytecodeProducer(StringRef producer) {
-+     emitBytecodeProducerFlag = producer.str();
-+@@ -320,6 +332,9 @@
-+   /// Emit bytecode at given version.
-+   std::optional<int64_t> emitBytecodeVersion = std::nullopt;
-+ 
-++  /// Target dialect versions for bytecode emission, as "dialect=version".
-++  std::vector<std::string> emitBytecodeDialectVersions;
-++
-+   /// Emit bytecode with given producer.
-+   std::string emitBytecodeProducerFlag = "";
-+ 
-+diff -ruN --strip-trailing-cr a/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp b/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp
-+--- a/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp
-++++ b/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp
-+@@ -13,6 +13,7 @@
-+ #include "mlir/Bytecode/Encoding.h"
-+ #include "mlir/IR/Attributes.h"
-+ #include "mlir/IR/Diagnostics.h"
-++#include "mlir/IR/MLIRContext.h"
-+ #include "mlir/IR/OpImplementation.h"
-+ #include "llvm/ADT/ArrayRef.h"
-+ #include "llvm/ADT/CachedHashString.h"
-+@@ -1373,6 +1374,16 @@
-+ 
-+ LogicalResult mlir::writeBytecodeToFile(Operation *op, raw_ostream &os,
-+                                         const BytecodeWriterConfig &config) {
-++  // Validate before numbering the IR, which may invoke dialect writers.
-++  for (const auto &entry : config.getDialectVersionMap()) {
-++    Dialect *dialect = op->getContext()->getLoadedDialect(entry.getKey());
-++    if (!dialect)
-++      continue;
-++    auto *interface =
-++        dialect->getRegisteredInterface<BytecodeDialectInterface>();
-++    if (interface && failed(interface->verifyVersion(op, *entry.getValue())))
-++      return failure();
-++  }
-+   BytecodeWriter writer(op, config);
-+   return writer.write(op, os);
-+ }
-+diff -ruN --strip-trailing-cr a/mlir/lib/IR/BuiltinDialectBytecode.cpp b/mlir/lib/IR/BuiltinDialectBytecode.cpp
-+--- a/mlir/lib/IR/BuiltinDialectBytecode.cpp
-++++ b/mlir/lib/IR/BuiltinDialectBytecode.cpp
-+@@ -13,6 +13,7 @@
-+ #include "mlir/IR/AffineMap.h"
-+ #include "mlir/IR/BuiltinAttributes.h"
-+ #include "mlir/IR/BuiltinDialect.h"
-++#include "mlir/IR/BuiltinOps.h"
-+ #include "mlir/IR/BuiltinTypes.h"
-+ #include "mlir/IR/Diagnostics.h"
-+ #include "mlir/IR/DialectResourceBlobManager.h"
-+@@ -578,13 +579,38 @@
-+   //===--------------------------------------------------------------------===//
-+   // Version
-+ 
-++  std::unique_ptr<DialectVersion>
-++  parseVersion(StringRef version) const override {
-++    int64_t parsedVersion;
-++    if (version.getAsInteger(10, parsedVersion) || parsedVersion < 0 ||
-++        parsedVersion > BuiltinDialectVersion::getCurrentVersion().getVersion())
-++      return nullptr;
-++    return std::make_unique<BuiltinDialectVersion>(parsedVersion);
-++  }
-++
-++  LogicalResult verifyVersion(Operation *topLevelOp,
-++                              const DialectVersion &version) const override {
-++    if (static_cast<const BuiltinDialectVersion &>(version).getVersion() >= 1)
-++      return success();
-++    WalkResult result = topLevelOp->walk([](ModuleOp module) {
-++      if (!module.getDltiAttr())
-++        return WalkResult::advance();
-++      module.emitOpError("cannot emit builtin dialect version 0 with a 'dlti' "
-++                         "property");
-++      return WalkResult::interrupt();
-++    });
-++    return failure(result.wasInterrupted());
-++  }
-++
-+   void writeVersion(DialectBytecodeWriter &writer) const override {
-+     auto configVersion = writer.getDialectVersion(getDialect()->getNamespace());
-+     // Write version set in config.
-+     if (succeeded(configVersion)) {
-+       auto *version =
-+           static_cast<const BuiltinDialectVersion *>(*configVersion);
-+-      writer.writeVarInt(static_cast<uint64_t>(version->getVersion()));
-++      // Version 0 predates dialect version metadata. Preserve its encoding.
-++      if (version->getVersion() > 0)
-++        writer.writeVarInt(static_cast<uint64_t>(version->getVersion()));
-+       return;
-+     }
-+     // Else, write current set version version if not 0.
-+diff -ruN --strip-trailing-cr a/mlir/lib/Tools/mlir-opt/MlirOptMain.cpp b/mlir/lib/Tools/mlir-opt/MlirOptMain.cpp
-+--- a/mlir/lib/Tools/mlir-opt/MlirOptMain.cpp
-++++ b/mlir/lib/Tools/mlir-opt/MlirOptMain.cpp
-+@@ -12,6 +12,7 @@
-+ //===----------------------------------------------------------------------===//
-+ 
-+ #include "mlir/Tools/mlir-opt/MlirOptMain.h"
-++#include "mlir/Bytecode/BytecodeImplementation.h"
-+ #include "mlir/Bytecode/BytecodeWriter.h"
-+ #include "mlir/Debug/CLOptionsSetup.h"
-+ #include "mlir/Debug/Counter.h"
-+@@ -36,6 +37,7 @@
-+ #include "mlir/Tools/Plugins/PassPlugin.h"
-+ #include "llvm/ADT/ScopeExit.h"
-+ #include "llvm/ADT/StringRef.h"
-++#include "llvm/ADT/StringSet.h"
-+ #include "llvm/Remarks/RemarkFormat.h"
-+ #include "llvm/Support/CommandLine.h"
-+ #include "llvm/Support/Debug.h"
-+@@ -107,6 +109,15 @@
-+             cl::desc("Use specified bytecode when generating output"),
-+             cl::location(emitBytecodeVersion), cl::init(std::nullopt));
-+ 
-++    static cl::list<std::string, std::vector<std::string>>
-++        bytecodeDialectVersions(
-++            "emit-bytecode-dialect-version",
-++            cl::desc(
-++                "Use the specified dialect version when generating bytecode "
-++                "(may be repeated for different dialects)"),
-++            cl::value_desc("dialect=version"),
-++            cl::location(emitBytecodeDialectVersions));
-++
-+     static cl::opt<std::string, /*ExternalStorage=*/true> irdlFile(
-+         "irdl-file",
-+         cl::desc("IRDL file to register before processing the input"),
-+@@ -620,6 +631,30 @@
-+                  : BytecodeWriterConfig(fallbackResourceMap);
-+     if (auto v = config.bytecodeVersionToEmit())
-+       writerConfig.setDesiredBytecodeVersion(*v);
-++    llvm::StringSet<> versionedDialects;
-++    for (StringRef entry : config.bytecodeDialectVersionsToEmit()) {
-++      auto [name, version] = entry.split('=');
-++      if (name.empty() || version.empty())
-++        return op.get()->emitError() << "expected 'dialect=version' for "
-++                                        "--emit-bytecode-dialect-version, got '"
-++                                     << entry << "'";
-++      if (!versionedDialects.insert(name).second)
-++        return op.get()->emitError()
-++               << "duplicate bytecode version for dialect '" << name << "'";
-++      Dialect *dialect = context->getOrLoadDialect(name);
-++      if (!dialect)
-++        return op.get()->emitError()
-++               << "unknown dialect '" << name << "' for bytecode emission";
-++      auto *interface =
-++          dialect->getRegisteredInterface<BytecodeDialectInterface>();
-++      std::unique_ptr<DialectVersion> parsedVersion =
-++          interface ? interface->parseVersion(version) : nullptr;
-++      if (!parsedVersion)
-++        return op.get()->emitError()
-++               << "dialect '" << name << "' does not support emitting bytecode "
-++               << "version '" << version << "'";
-++      writerConfig.setDialectVersion(name, std::move(parsedVersion));
-++    }
-+     if (config.shouldElideResourceDataFromBytecode())
-+       writerConfig.setElideResourceDataFlag();
-+     return writeBytecodeToFile(op.get(), os, writerConfig);
-+@@ -629,6 +664,10 @@
-+     return emitError(UnknownLoc::get(pm.getContext()))
-+            << "bytecode version while not emitting bytecode";
-+ 
-++  if (!config.bytecodeDialectVersionsToEmit().empty())
-++    return emitError(UnknownLoc::get(pm.getContext()))
-++           << "dialect bytecode version while not emitting bytecode";
-++
-+   // Don't re-run the verifier if we already ran the verifier at the end of the
-+   // pass pipeline.
-+   AsmState asmState(op.get(),
-+diff -ruN --strip-trailing-cr a/mlir/test/Bytecode/bytecode_downgrade.mlir b/mlir/test/Bytecode/bytecode_downgrade.mlir
-+--- a/mlir/test/Bytecode/bytecode_downgrade.mlir
-++++ b/mlir/test/Bytecode/bytecode_downgrade.mlir
-+@@ -4,7 +4,5 @@
-+   "test.versionedA"() <{dims = 123 : i64, modifier = false}> : () -> ()
-+ }
-+ 
-+-// COM: the property downgrader is executed twice: first for IR numbering and then for emission.
-+ // CHECK: downgrading op...
-+-// CHECK: downgrading op properties...
-+-// CHECK: downgrading op properties...
-++// CHECK: "test.versionedA"() <{dims = 123 : i64, modifier = false}>
-+diff -ruN --strip-trailing-cr a/mlir/test/Bytecode/versioning/emit-builtin-version-dlti.mlir b/mlir/test/Bytecode/versioning/emit-builtin-version-dlti.mlir
-+--- a/mlir/test/Bytecode/versioning/emit-builtin-version-dlti.mlir
-++++ b/mlir/test/Bytecode/versioning/emit-builtin-version-dlti.mlir
-+@@ -0,0 +1,16 @@
-++// RUN: mlir-opt %s -split-input-file -emit-bytecode -emit-bytecode-dialect-version=builtin=0 -verify-diagnostics
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin=1 | mlir-opt | FileCheck %s
-++
-++// A property introduced in version 1 cannot be silently dropped for version 0.
-++// CHECK: module <dlti = #dlti.map<"chip" = "sm_90">>
-++// expected-error@+1 {{cannot emit builtin dialect version 0 with a 'dlti' property}}
-++module <{dlti = #dlti.map<"chip" = "sm_90">}> {}
-++
-++// -----
-++
-++// Also reject DLTI properties on nested modules.
-++// CHECK: module @nested <dlti = #dlti.map<"chip" = "sm_90">>
-++module {
-++  // expected-error@+1 {{cannot emit builtin dialect version 0 with a 'dlti' property}}
-++  module @nested <{dlti = #dlti.map<"chip" = "sm_90">}> {}
-++}
-+diff -ruN --strip-trailing-cr a/mlir/test/Bytecode/versioning/emit-dialect-version.mlir b/mlir/test/Bytecode/versioning/emit-dialect-version.mlir
-+--- a/mlir/test/Bytecode/versioning/emit-dialect-version.mlir
-++++ b/mlir/test/Bytecode/versioning/emit-dialect-version.mlir
-+@@ -0,0 +1,36 @@
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-producer=fixed -emit-bytecode-dialect-version=builtin=0 -emit-bytecode-dialect-version=test=2.0 -o %t.0
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-producer=fixed -emit-bytecode-dialect-version=builtin=1 -emit-bytecode-dialect-version=test=2.0 -o %t.1
-++// RUN: not cmp -s %t.0 %t.1
-++// RUN: mlir-opt %t.0 | FileCheck %s
-++// RUN: mlir-opt %t.1 | FileCheck %s
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-producer=fixed -o %t.default
-++// RUN: cmp -s %t.1 %t.default
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-producer=fixed -emit-bytecode-dialect-version=builtin=1 -emit-bytecode-dialect-version=test=1.12 -o %t.old-test
-++// RUN: not cmp -s %t.old-test %t.1
-++// RUN: mlir-opt %t.old-test | FileCheck %s
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=test=1.12 | mlir-opt | FileCheck %s
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-version=0 -emit-bytecode-dialect-version=test=1.12 | mlir-opt | FileCheck %s
-++// RUN: not mlir-opt %s -emit-bytecode-dialect-version=builtin=0 2>&1 | FileCheck %s --check-prefix=NO-BYTECODE
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin 2>&1 | FileCheck %s --check-prefix=MALFORMED
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin= 2>&1 | FileCheck %s --check-prefix=MALFORMED
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version==0 2>&1 | FileCheck %s --check-prefix=MALFORMED
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=unknown=0 2>&1 | FileCheck %s --check-prefix=UNKNOWN
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=arith=0 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-DIALECT
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=func=1 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-PARSER
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin=-1 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-VERSION
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin=2 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-VERSION
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin=abc 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-VERSION
-++// RUN: not mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=builtin=0 -emit-bytecode-dialect-version=builtin=1 2>&1 | FileCheck %s --check-prefix=DUPLICATE
-++
-++// NO-BYTECODE: dialect bytecode version while not emitting bytecode
-++// MALFORMED: expected 'dialect=version' for --emit-bytecode-dialect-version
-++// UNKNOWN: unknown dialect 'unknown' for bytecode emission
-++// UNSUPPORTED-DIALECT: dialect 'arith' does not support emitting bytecode version '0'
-++// UNSUPPORTED-PARSER: dialect 'func' does not support emitting bytecode version '1'
-++// UNSUPPORTED-VERSION: dialect 'builtin' does not support emitting bytecode version
-++// DUPLICATE: duplicate bytecode version for dialect 'builtin'
-++
-++// CHECK: "test.versionedA"() <{dims = 123 : i64, modifier = false}>
-++"test.versionedA"() <{dims = 123 : i64, modifier = false}> : () -> ()
-++// CHECK: "test.versionedC"() <{attribute = #test.attr_params<42, 24>}>
-++"test.versionedC"() <{attribute = #test.attr_params<42, 24>}> : () -> ()
-+diff -ruN --strip-trailing-cr a/mlir/test/Bytecode/versioning/emit-test-version-lossy.mlir b/mlir/test/Bytecode/versioning/emit-test-version-lossy.mlir
-+--- a/mlir/test/Bytecode/versioning/emit-test-version-lossy.mlir
-++++ b/mlir/test/Bytecode/versioning/emit-test-version-lossy.mlir
-+@@ -0,0 +1,12 @@
-++// RUN: mlir-opt %s -split-input-file -emit-bytecode -emit-bytecode-dialect-version=test=1.12 -verify-diagnostics
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=test=2.0 | mlir-opt | FileCheck %s
-++
-++// CHECK: "test.versionedA"() <{dims = 123 : i64, modifier = true}>
-++// expected-error@+1 {{cannot emit test dialect versions before 2.0 with 'modifier = true'}}
-++"test.versionedA"() <{dims = 123 : i64, modifier = true}> : () -> ()
-++
-++// -----
-++
-++// CHECK: test.with_versioned_properties 1 | 2
-++// expected-error@+1 {{cannot emit test dialect versions before 2.0 with a nonzero 'value2' property}}
-++test.with_versioned_properties 1 | 2
-+diff -ruN --strip-trailing-cr a/mlir/test/Bytecode/versioning/versioned_op_with_native_properties.mlir b/mlir/test/Bytecode/versioning/versioned_op_with_native_properties.mlir
-+--- a/mlir/test/Bytecode/versioning/versioned_op_with_native_properties.mlir
-++++ b/mlir/test/Bytecode/versioning/versioned_op_with_native_properties.mlir
-+@@ -26,3 +26,9 @@
-+ // COM: }
-+ // RUN: mlir-opt %S/versioned-op-with-native-prop-1.12.mlirbc 2>&1 | FileCheck %s --check-prefix=CHECK3
-+ // CHECK3: test.with_versioned_properties 1 | 0
-++
-++// Verify emission for both historical and current dialect versions.
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=test=1.12 | mlir-opt | FileCheck %s --check-prefix=EMIT
-++// RUN: mlir-opt %s -emit-bytecode -emit-bytecode-dialect-version=test=2.0 | mlir-opt | FileCheck %s --check-prefix=EMIT
-++// EMIT: test.with_versioned_properties 1 | 0
-++test.with_versioned_properties 1 | 0
-+diff -ruN --strip-trailing-cr a/mlir/test/Dialect/Builtin/Bytecode/builtin_fixed.mlir b/mlir/test/Dialect/Builtin/Bytecode/builtin_fixed.mlir
-+--- a/mlir/test/Dialect/Builtin/Bytecode/builtin_fixed.mlir
-++++ b/mlir/test/Dialect/Builtin/Bytecode/builtin_fixed.mlir
-+@@ -1,8 +1,14 @@
-++// Verify that both historical and current builtin encodings are unchanged.
-++// RUN: mlir-opt -allow-unregistered-dialect -emit-bytecode -emit-bytecode-producer=fixed -emit-bytecode-dialect-version=builtin=0 %s -o %t.0
-++// RUN: cmp -s %t.0 %p/builtin_fixed_0.mlirbc
-++// RUN: mlir-opt -allow-unregistered-dialect -emit-bytecode -emit-bytecode-producer=fixed -emit-bytecode-dialect-version=builtin=1 %s -o %t.1
-++// RUN: cmp -s %t.1 %p/builtin_fixed_1.mlirbc
-++// Verify that the default encoding is the current version.
-+ // RUN: mlir-opt -allow-unregistered-dialect -emit-bytecode -emit-bytecode-producer=fixed %s -o %t
-+-// Verify unchanged.
-+-// RUN: cmp -s %t %p/builtin_fixed_0.mlirbc
-+-// Verify can read as expected.
-+-// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-local-scope %t | FileCheck %s
-++// RUN: cmp -s %t %t.1
-++// Verify that the checked-in fixtures can be read as expected.
-++// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-local-scope %p/builtin_fixed_0.mlirbc | FileCheck %s
-++// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-local-scope %p/builtin_fixed_1.mlirbc | FileCheck %s
-+ 
-+ // Regression test for all builtin dialect bytecode attribute and
-+ // type encodings. Exercises every entry in BuiltinDialectAttributes and
-+diff -ruN --strip-trailing-cr a/mlir/test/lib/Dialect/Test/TestDialectInterfaces.cpp b/mlir/test/lib/Dialect/Test/TestDialectInterfaces.cpp
-+--- a/mlir/test/lib/Dialect/Test/TestDialectInterfaces.cpp
-++++ b/mlir/test/lib/Dialect/Test/TestDialectInterfaces.cpp
-+@@ -9,6 +9,7 @@
-+ #include "TestDialect.h"
-+ #include "TestOps.h"
-+ #include "TestTypes.h"
-++#include "mlir/Bytecode/Encoding.h"
-+ #include "mlir/Conversion/ConvertToEmitC/ToEmitCInterface.h"
-+ #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
-+ #include "mlir/Dialect/EmitC/IR/EmitC.h"
-+@@ -74,9 +75,19 @@
-+   LogicalResult writeAttribute(Attribute attr,
-+                                DialectBytecodeWriter &writer) const final {
-+     if (auto concreteAttr = llvm::dyn_cast<TestAttrParamsAttr>(attr)) {
-++      // Without dialect version metadata, use the textual fallback rather than
-++      // emit a historical encoding that a reader would interpret as current.
-++      if (writer.getBytecodeVersion() < bytecode::kDialectVersioning)
-++        return failure();
-+       writer.writeVarInt(test_encoding::k_attr_params);
-+-      writer.writeVarInt(concreteAttr.getV0());
-+-      writer.writeVarInt(concreteAttr.getV1());
-++      auto version = writer.getDialectVersion<TestDialect>();
-++      bool useOldEncoding =
-++          succeeded(version) &&
-++          static_cast<const TestDialectVersion *>(*version)->major_ < 2;
-++      writer.writeVarInt(useOldEncoding ? concreteAttr.getV1()
-++                                        : concreteAttr.getV0());
-++      writer.writeVarInt(useOldEncoding ? concreteAttr.getV0()
-++                                        : concreteAttr.getV1());
-+       return success();
-+     }
-+     return failure();
-+@@ -97,6 +108,39 @@
-+     return Attribute();
-+   }
-+ 
-++  std::unique_ptr<DialectVersion> parseVersion(StringRef version) const final {
-++    auto [major, minor] = version.split('.');
-++    uint32_t majorVersion, minorVersion;
-++    if (major.getAsInteger(10, majorVersion) ||
-++        minor.getAsInteger(10, minorVersion) || majorVersion > 2 ||
-++        (majorVersion == 2 && minorVersion > 0))
-++      return nullptr;
-++    return std::make_unique<TestDialectVersion>(majorVersion, minorVersion);
-++  }
-++
-++  LogicalResult verifyVersion(Operation *topLevelOp,
-++                              const DialectVersion &version) const final {
-++    if (static_cast<const TestDialectVersion &>(version).major_ >= 2)
-++      return success();
-++    WalkResult result = topLevelOp->walk([](TestVersionedOpA op) {
-++      if (!op.getModifier())
-++        return WalkResult::advance();
-++      op.emitOpError("cannot emit test dialect versions before 2.0 with "
-++                     "'modifier = true'");
-++      return WalkResult::interrupt();
-++    });
-++    if (result.wasInterrupted())
-++      return failure();
-++    result = topLevelOp->walk([](TestOpWithVersionedProperties op) {
-++      if (op.getProperties().prop.value2 == 0)
-++        return WalkResult::advance();
-++      op.emitOpError("cannot emit test dialect versions before 2.0 with "
-++                     "a nonzero 'value2' property");
-++      return WalkResult::interrupt();
-++    });
-++    return failure(result.wasInterrupted());
-++  }
-++
-+   // Emit a specific version of the dialect.
-+   void writeVersion(DialectBytecodeWriter &writer) const final {
-+     // Construct the current dialect version.
-+diff -ruN --strip-trailing-cr a/mlir/test/lib/Dialect/Test/TestOpDefs.cpp b/mlir/test/lib/Dialect/Test/TestOpDefs.cpp
-+--- a/mlir/test/lib/Dialect/Test/TestOpDefs.cpp
-++++ b/mlir/test/lib/Dialect/Test/TestOpDefs.cpp
-+@@ -1777,7 +1777,6 @@
-+     const auto *version =
-+         reinterpret_cast<const TestDialectVersion *>(*maybeVersion);
-+     if ((version->major_ < 2)) {
-+-      llvm::outs() << "downgrading op properties...\n";
-+       return;
-+     }
-+   }
-+@@ -1818,6 +1817,10 @@
-+     mlir::DialectBytecodeWriter &writer,
-+     const test::VersionedProperties &prop) {
-+   writer.writeVarInt(prop.value1);
-++  auto version = writer.getDialectVersion<test::TestDialect>();
-++  if (succeeded(version) &&
-++      static_cast<const TestDialectVersion *>(*version)->major_ < 2)
-++    return;
-+   writer.writeVarInt(prop.value2);
-+ }
-+ 
-+diff -ruN --strip-trailing-cr a/utils/bazel/llvm-project-overlay/lldb/BUILD.bazel b/utils/bazel/llvm-project-overlay/lldb/BUILD.bazel
-+--- a/utils/bazel/llvm-project-overlay/lldb/BUILD.bazel
-++++ b/utils/bazel/llvm-project-overlay/lldb/BUILD.bazel
-+@@ -914,6 +914,22 @@
-+ )
-+ 
-+ cc_library(
-++    name = "Register",
-++    srcs = glob(["source/Register/**/*.cpp"]),
-++    hdrs = glob(["source/Register/**/*.h"]),
-++    includes = ["source"],
-++    deps = [
-++        ":CoreHeaders",
-++        ":Headers",
-++        ":TargetHeaders",
-++        ":Utility",
-++        ":UtilityPrivateHeaders",
-++        "//llvm:Support",
-++        "//llvm:TargetParser",
-++    ],
-++)
-++
-++cc_library(
-+     name = "Utility",
-+     srcs = glob(["source/Utility/**/*.cpp"]),
-+     hdrs = glob(["include/lldb/Utility/**/*.h"]),
-+diff -ruN --strip-trailing-cr a/utils/bazel/llvm-project-overlay/lldb/source/Plugins/BUILD.bazel b/utils/bazel/llvm-project-overlay/lldb/source/Plugins/BUILD.bazel
-+--- a/utils/bazel/llvm-project-overlay/lldb/source/Plugins/BUILD.bazel
-++++ b/utils/bazel/llvm-project-overlay/lldb/source/Plugins/BUILD.bazel
-+@@ -71,6 +71,7 @@
-+         "//lldb:Headers",
-+         "//lldb:Host",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Target",
-+@@ -278,6 +279,7 @@
-+         "//lldb:ExpressionHeaders",
-+         "//lldb:Headers",
-+         "//lldb:Host",
-++        "//lldb:Register",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:TargetHeaders",
-+         "//lldb:Utility",
-+@@ -618,6 +620,7 @@
-+         "//lldb:Core",
-+         "//lldb:Host",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Target",
-+         "//lldb:TargetHeaders",
-+@@ -898,6 +901,7 @@
-+         "//clang:ast",
-+         "//lldb:Core",
-+         "//lldb:Headers",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Target",
-+@@ -1390,6 +1394,7 @@
-+         ":PluginProcessUtility",
-+         "//lldb:Core",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Utility",
-+@@ -1405,6 +1410,7 @@
-+         ":PluginProcessUtility",
-+         "//lldb:Core",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Utility",
-+@@ -1420,6 +1426,7 @@
-+     deps = [
-+         ":PluginProcessUtility",
-+         "//lldb:Core",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Target",
-+@@ -1441,6 +1448,7 @@
-+         "//lldb:Core",
-+         "//lldb:Host",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Utility",
-+@@ -1479,6 +1487,7 @@
-+         ":PluginProcessUtility",
-+         "//lldb:Core",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Utility",
-+@@ -1495,6 +1504,7 @@
-+         ":PluginProcessUtility",
-+         "//lldb:Core",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Utility",
-+@@ -1987,6 +1997,7 @@
-+         "//lldb:Core",
-+         "//lldb:Host",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Target",
-+@@ -2123,6 +2134,7 @@
-+         "//lldb:Core",
-+         "//lldb:Headers",
-+         "//lldb:Host",
-++        "//lldb:Register",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:TargetHeaders",
-+         "//lldb:Utility",
-+@@ -2217,6 +2229,7 @@
-+         "//lldb:Core",
-+         "//lldb:Headers",
-+         "//lldb:Host",
-++        "//lldb:Register",
-+         "//lldb:Symbol",
-+         "//lldb:SymbolHeaders",
-+         "//lldb:Target",
-+@@ -2282,6 +2295,7 @@
-+         "//lldb:Core",
-+         "//lldb:Headers",
-+         "//lldb:InterpreterHeaders",
-++        "//lldb:Register",
-+         "//lldb:Target",
-+         "//lldb:TargetHeaders",
-+         "//lldb:Utility",
-+@@ -2349,6 +2363,7 @@
-+         "//lldb:Core",
-+         "//lldb:Headers",
-+         "//lldb:Host",
-++        "//lldb:Register",
-+         "//lldb:Target",
-+         "//lldb:Utility",
-+         "//llvm:Support",
-+diff -ruN --strip-trailing-cr a/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel b/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel
-+--- a/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel
-++++ b/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel
-+@@ -9874,6 +9874,7 @@
-+     hdrs = ["include/mlir/Tools/mlir-opt/MlirOptMain.h"],
-+     includes = ["include"],
-+     deps = [
-++        ":BytecodeOpInterface",
-+         ":BytecodeWriter",
-+         ":Debug",
-+         ":IR",
-+diff -ruN --strip-trailing-cr a/utils/bazel/llvm-project-overlay/mlir/test/Dialect/BUILD.bazel b/utils/bazel/llvm-project-overlay/mlir/test/Dialect/BUILD.bazel
-+--- a/utils/bazel/llvm-project-overlay/mlir/test/Dialect/BUILD.bazel
-++++ b/utils/bazel/llvm-project-overlay/mlir/test/Dialect/BUILD.bazel
-+@@ -10,6 +10,7 @@
-+         srcs = [src],
-+         data = [
-+             "Builtin/Bytecode/builtin_fixed_0.mlirbc",
-++            "Builtin/Bytecode/builtin_fixed_1.mlirbc",
-+             "Vector/vector-sink-transform.mlir",
-+             "//llvm:llc",
-+             "//llvm:llvm-symbolizer",
-diff --git a/third_party/llvm/workspace.bzl b/third_party/llvm/workspace.bzl
-index 8bde547d..e494cfdf 100644
---- a/third_party/llvm/workspace.bzl
-+++ b/third_party/llvm/workspace.bzl
-@@ -19,8 +19,8 @@ load("//third_party:repo.bzl", "tf_http_archive")
- 
- def repo(name):
-     """Imports LLVM."""
--    LLVM_COMMIT = "4fa92e8e51e6833f8d70ab9fa136d899e497f135"
--    LLVM_SHA256 = "3e33d6506a6d9e779dda03c355310e58269b3c90aa70bb2de9a1203c449aedff"
-+    LLVM_COMMIT = "f9cea2f24b6713cc344a875e674d45728c19d24e"
-+    LLVM_SHA256 = "38df2ccdfa07f3d88aec4f9f9293c01695fa1d5d354e1d84e0dc8a6492b6cd4f"
- 
-     tf_http_archive(
-         name = name,
-diff --git a/third_party/stablehlo/temporary.patch b/third_party/stablehlo/temporary.patch
-index 671fbe6c..1ae539e8 100644
---- a/third_party/stablehlo/temporary.patch
-+++ b/third_party/stablehlo/temporary.patch
-@@ -81,6 +81,32 @@ diff --ruN a/stablehlo/stablehlo/dialect/ChloOps.td b/stablehlo/stablehlo/dialec
-  
-      See
-      https://www.tensorflow.org/xla/operation_semantics#element-wise_comparison_operations.
-+diff --ruN a/stablehlo/stablehlo/dialect/Serialization.cpp b/stablehlo/stablehlo/dialect/Serialization.cpp
-+--- stablehlo/stablehlo/dialect/Serialization.cpp
-++++ stablehlo/stablehlo/dialect/Serialization.cpp
-+@@ -15,10 +15,13 @@
-+ 
-+ #include "stablehlo/dialect/Serialization.h"
-+ 
-++#include <memory>
-++
-+ #include "llvm/Support/Debug.h"
-+ #include "llvm/Support/MemoryBuffer.h"
-+ #include "mlir/Bytecode/BytecodeReader.h"
-+ #include "mlir/Bytecode/BytecodeWriter.h"
-++#include "mlir/IR/BuiltinDialect.h"
-+ #include "mlir/IR/BuiltinOps.h"
-+ #include "mlir/IR/Diagnostics.h"
-+ #include "mlir/IR/Location.h"
-+@@ -84,6 +87,8 @@
-+       vhlo::Version::fromString(targetVersion)->getBytecodeVersion();
-+   if (failed(bytecodeVersion)) return failure();
-+   writerConfig.setDesiredBytecodeVersion(bytecodeVersion.value());
-++  writerConfig.setDialectVersion<BuiltinDialect>(
-++      std::make_unique<BuiltinDialectVersion>(/*version=*/0));
-+   return writeBytecodeToFile(module, os, writerConfig);
-+ }
-+ 
- diff --ruN a/stablehlo/stablehlo/dialect/StablehloEnums.td b/stablehlo/stablehlo/dialect/StablehloEnums.td
- --- stablehlo/stablehlo/dialect/StablehloEnums.td
- +++ stablehlo/stablehlo/dialect/StablehloEnums.td
-@@ -95,6 +121,84 @@ diff --ruN a/stablehlo/stablehlo/dialect/StablehloEnums.td b/stablehlo/stablehlo
-  def STABLEHLO_COMPARISON_TYPE_WEAK_ORDER : I32EnumAttrCase<"WEAKORDER", 5>;
-  
-  def StableHLO_ComparisonType : I32EnumAttr<"ComparisonType",
-+diff --ruN a/stablehlo/stablehlo/tests/chlo/chlo_legalize_to_stablehlo.mlir b/stablehlo/stablehlo/tests/chlo/chlo_legalize_to_stablehlo.mlir
-+--- stablehlo/stablehlo/tests/chlo/chlo_legalize_to_stablehlo.mlir
-++++ stablehlo/stablehlo/tests/chlo/chlo_legalize_to_stablehlo.mlir
-+@@ -69,6 +69,74 @@
-+ 
-+ // -----
-+ 
-++// CHECK-LABEL:   func.func @acos_bf16(
-++// CHECK-SAME:      %[[ARG0:.*]]: tensor<bf16>) -> tensor<bf16> {
-++// CHECK:           %[[CONSTANT_0:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
-++// CHECK:           %[[SUBTRACT_0:.*]] = stablehlo.subtract %[[CONSTANT_0]], %[[ARG0]] : tensor<bf16>
-++// CHECK:           %[[ADD_0:.*]] = stablehlo.add %[[CONSTANT_0]], %[[ARG0]] : tensor<bf16>
-++// CHECK:           %[[MULTIPLY_0:.*]] = stablehlo.multiply %[[SUBTRACT_0]], %[[ADD_0]] : tensor<bf16>
-++// CHECK:           %[[SQRT_0:.*]] = stablehlo.sqrt %[[MULTIPLY_0]] : tensor<bf16>
-++// CHECK:           %[[VAL_0:.*]] = stablehlo.atan2 %[[SQRT_0]], %[[ARG0]] : tensor<bf16>
-++// CHECK:           return %[[VAL_0]] : tensor<bf16>
-++// CHECK:         }
-++func.func @acos_bf16(%arg : tensor<bf16>) -> tensor<bf16> {
-++  %result = "chlo.acos"(%arg) : (tensor<bf16>) -> tensor<bf16>
-++  func.return %result : tensor<bf16>
-++}
-++
-++// -----
-++
-++// CHECK-LABEL:   func.func @acos_f16(
-++// CHECK-SAME:      %[[ARG0:.*]]: tensor<f16>) -> tensor<f16> {
-++// CHECK:           %[[CONSTANT_0:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<f16>
-++// CHECK:           %[[SUBTRACT_0:.*]] = stablehlo.subtract %[[CONSTANT_0]], %[[ARG0]] : tensor<f16>
-++// CHECK:           %[[ADD_0:.*]] = stablehlo.add %[[CONSTANT_0]], %[[ARG0]] : tensor<f16>
-++// CHECK:           %[[MULTIPLY_0:.*]] = stablehlo.multiply %[[SUBTRACT_0]], %[[ADD_0]] : tensor<f16>
-++// CHECK:           %[[SQRT_0:.*]] = stablehlo.sqrt %[[MULTIPLY_0]] : tensor<f16>
-++// CHECK:           %[[VAL_0:.*]] = stablehlo.atan2 %[[SQRT_0]], %[[ARG0]] : tensor<f16>
-++// CHECK:           return %[[VAL_0]] : tensor<f16>
-++// CHECK:         }
-++func.func @acos_f16(%arg : tensor<f16>) -> tensor<f16> {
-++  %result = "chlo.acos"(%arg) : (tensor<f16>) -> tensor<f16>
-++  func.return %result : tensor<f16>
-++}
-++
-++// -----
-++
-++// CHECK-LABEL:   func.func @acos_f32(
-++// CHECK-SAME:      %[[ARG0:.*]]: tensor<f32>) -> tensor<f32> {
-++// CHECK:           %[[CONSTANT_0:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-++// CHECK:           %[[SUBTRACT_0:.*]] = stablehlo.subtract %[[CONSTANT_0]], %[[ARG0]] : tensor<f32>
-++// CHECK:           %[[ADD_0:.*]] = stablehlo.add %[[CONSTANT_0]], %[[ARG0]] : tensor<f32>
-++// CHECK:           %[[MULTIPLY_0:.*]] = stablehlo.multiply %[[SUBTRACT_0]], %[[ADD_0]] : tensor<f32>
-++// CHECK:           %[[SQRT_0:.*]] = stablehlo.sqrt %[[MULTIPLY_0]] : tensor<f32>
-++// CHECK:           %[[VAL_0:.*]] = stablehlo.atan2 %[[SQRT_0]], %[[ARG0]] : tensor<f32>
-++// CHECK:           return %[[VAL_0]] : tensor<f32>
-++// CHECK:         }
-++func.func @acos_f32(%arg : tensor<f32>) -> tensor<f32> {
-++  %result = "chlo.acos"(%arg) : (tensor<f32>) -> tensor<f32>
-++  func.return %result : tensor<f32>
-++}
-++
-++// -----
-++
-++// CHECK-LABEL:   func.func @acos_f64(
-++// CHECK-SAME:      %[[ARG0:.*]]: tensor<f64>) -> tensor<f64> {
-++// CHECK:           %[[CONSTANT_0:.*]] = stablehlo.constant dense<1.000000e+00> : tensor<f64>
-++// CHECK:           %[[SUBTRACT_0:.*]] = stablehlo.subtract %[[CONSTANT_0]], %[[ARG0]] : tensor<f64>
-++// CHECK:           %[[ADD_0:.*]] = stablehlo.add %[[CONSTANT_0]], %[[ARG0]] : tensor<f64>
-++// CHECK:           %[[MULTIPLY_0:.*]] = stablehlo.multiply %[[SUBTRACT_0]], %[[ADD_0]] : tensor<f64>
-++// CHECK:           %[[SQRT_0:.*]] = stablehlo.sqrt %[[MULTIPLY_0]] : tensor<f64>
-++// CHECK:           %[[VAL_0:.*]] = stablehlo.atan2 %[[SQRT_0]], %[[ARG0]] : tensor<f64>
-++// CHECK:           return %[[VAL_0]] : tensor<f64>
-++// CHECK:         }
-++func.func @acos_f64(%arg : tensor<f64>) -> tensor<f64> {
-++  %result = "chlo.acos"(%arg) : (tensor<f64>) -> tensor<f64>
-++  func.return %result : tensor<f64>
-++}
-++
-++// -----
-++
-+ // CHECK-LABEL:   func.func @asin_complex_f32(
-+ // CHECK-SAME:      %[[ARG0:.*]]: tensor<complex<f32>>) -> tensor<complex<f32>> {
-+ // CHECK:           %[[REAL_0:.*]] = stablehlo.real %[[ARG0]] : (tensor<complex<f32>>) -> tensor<f32>
- diff --ruN a/stablehlo/stablehlo/tests/interpret/compare.mlir b/stablehlo/stablehlo/tests/interpret/compare.mlir
- --- stablehlo/stablehlo/tests/interpret/compare.mlir
- +++ stablehlo/stablehlo/tests/interpret/compare.mlir
-@@ -343,6 +447,85 @@ diff --ruN a/stablehlo/stablehlo/tests/transforms/stablehlo_aggressive_simplific
-    // CHECK: return [[ARG0]], [[ARG0]]
-    func.return %0, %1 : tensor<i1>, tensor<i1>
-  }
-+diff --ruN a/stablehlo/stablehlo/tests/transforms/stablehlo_compatibility_expander.mlir b/stablehlo/stablehlo/tests/transforms/stablehlo_compatibility_expander.mlir
-+--- stablehlo/stablehlo/tests/transforms/stablehlo_compatibility_expander.mlir
-++++ stablehlo/stablehlo/tests/transforms/stablehlo_compatibility_expander.mlir
-+@@ -1,5 +1,5 @@
-+ // RUN: stablehlo-opt %s -verify-diagnostics -split-input-file --stablehlo-compatibility-expander='target=1.0.0' --chlo-legalize-to-stablehlo | FileCheck %s --check-prefixes=CHECK
-+-// RUN: stablehlo-opt %s -verify-diagnostics -split-input-file --stablehlo-compatibility-expander='target=1.6.0' --chlo-legalize-to-stablehlo | FileCheck %s --check-prefixes=CHECK-NO-DOWNGRADE
-++// RUN: stablehlo-opt %s -verify-diagnostics -split-input-file --stablehlo-compatibility-expander='target=1.23.0' --chlo-legalize-to-stablehlo | FileCheck %s --check-prefixes=CHECK-NO-DOWNGRADE
-+ 
-+ // -----
-+ 
-+@@ -583,3 +583,68 @@
-+   return %0 : tensor<4xf32>
-+ }
-+ 
-++// -----
-++
-++// CHECK-LABEL: @exp2_op_non_complex
-++// CHECK-DAG: %[[cst:.*]] = stablehlo.constant dense<0.69314718055994529> : tensor<4xf64>
-++// CHECK-DAG: %[[mul:.*]] = stablehlo.multiply %arg0, %[[cst]] : tensor<4xf64>
-++// CHECK: %[[exp:.*]] = stablehlo.exponential %[[mul]] : tensor<4xf64>
-++// CHECK: return %[[exp]] : tensor<4xf64>
-++func.func @exp2_op_non_complex(%arg0: tensor<4xf64>) -> tensor<4xf64> {
-++  // CHECK-NO-DOWNGRADE: stablehlo.exp2 %arg0 : tensor<4xf64>
-++  %0 = stablehlo.exp2 %arg0 : tensor<4xf64>
-++  func.return %0 : tensor<4xf64>
-++}
-++
-++// -----
-++
-++// CHECK-LABEL: @exp2_op_complex
-++// CHECK-DAG: %[[cst:.*]] = stablehlo.constant dense<0.69314718055994529> : tensor<4xf64>
-++// CHECK-DAG: %[[complex:.*]] = stablehlo.complex %arg0, %arg1 : tensor<4xcomplex<f64>>
-++// CHECK: %[[real:.*]] = stablehlo.real %[[complex]] : (tensor<4xcomplex<f64>>) -> tensor<4xf64>
-++// CHECK: %[[mul_real:.*]] = stablehlo.multiply %[[real]], %[[cst]] : tensor<4xf64>
-++// CHECK: %[[imag:.*]] = stablehlo.imag %[[complex]] : (tensor<4xcomplex<f64>>) -> tensor<4xf64>
-++// CHECK: %[[mul_imag:.*]] = stablehlo.multiply %[[imag]], %[[cst]] : tensor<4xf64>
-++// CHECK: %[[scaled:.*]] = stablehlo.complex %[[mul_real]], %[[mul_imag]] : tensor<4xcomplex<f64>>
-++// CHECK: %[[exp:.*]] = stablehlo.exponential %[[scaled]] : tensor<4xcomplex<f64>>
-++// CHECK: return %[[exp]] : tensor<4xcomplex<f64>>
-++func.func @exp2_op_complex(%arg0: tensor<4xf64>, %arg1: tensor<4xf64>) -> tensor<4xcomplex<f64>> {
-++  %0 = stablehlo.complex %arg0, %arg1 : tensor<4xcomplex<f64>>
-++  // CHECK-NO-DOWNGRADE: stablehlo.exp2 %0 : tensor<4xcomplex<f64>>
-++  %1 = stablehlo.exp2 %0 : tensor<4xcomplex<f64>>
-++  func.return %1 : tensor<4xcomplex<f64>>
-++}
-++
-++// -----
-++
-++// CHECK-LABEL: @log2_op_non_complex
-++// CHECK-DAG: %[[cst:.*]] = stablehlo.constant dense<0.69314718055994529> : tensor<4xf64>
-++// CHECK-DAG: %[[log:.*]] = stablehlo.log %arg0 : tensor<4xf64>
-++// CHECK: %[[div:.*]] = stablehlo.divide %[[log]], %[[cst]] : tensor<4xf64>
-++// CHECK: return %[[div]] : tensor<4xf64>
-++func.func @log2_op_non_complex(%arg0: tensor<4xf64>) -> tensor<4xf64> {
-++  // CHECK-NO-DOWNGRADE: stablehlo.log2 %arg0 : tensor<4xf64>
-++  %0 = stablehlo.log2 %arg0 : tensor<4xf64>
-++  func.return %0 : tensor<4xf64>
-++}
-++
-++// -----
-++
-++// CHECK-LABEL: @log2_op_complex
-++// CHECK-DAG: %[[cst:.*]] = stablehlo.constant dense<0.69314718055994529> : tensor<4xf64>
-++// CHECK-DAG: %[[complex:.*]] = stablehlo.complex %arg0, %arg1 : tensor<4xcomplex<f64>>
-++// CHECK: %[[log:.*]] = stablehlo.log %[[complex]] : tensor<4xcomplex<f64>>
-++// CHECK: %[[real:.*]] = stablehlo.real %[[log]] : (tensor<4xcomplex<f64>>) -> tensor<4xf64>
-++// CHECK: %[[div_real:.*]] = stablehlo.divide %[[real]], %[[cst]] : tensor<4xf64>
-++// CHECK: %[[imag:.*]] = stablehlo.imag %[[log]] : (tensor<4xcomplex<f64>>) -> tensor<4xf64>
-++// CHECK: %[[div_imag:.*]] = stablehlo.divide %[[imag]], %[[cst]] : tensor<4xf64>
-++// CHECK: %[[res:.*]] = stablehlo.complex %[[div_real]], %[[div_imag]] : tensor<4xcomplex<f64>>
-++// CHECK: return %[[res]] : tensor<4xcomplex<f64>>
-++func.func @log2_op_complex(%arg0: tensor<4xf64>, %arg1: tensor<4xf64>) -> tensor<4xcomplex<f64>> {
-++  %0 = stablehlo.complex %arg0, %arg1 : tensor<4xcomplex<f64>>
-++  // CHECK-NO-DOWNGRADE: stablehlo.log2 %0 : tensor<4xcomplex<f64>>
-++  %1 = stablehlo.log2 %0 : tensor<4xcomplex<f64>>
-++  func.return %1 : tensor<4xcomplex<f64>>
-++}
-++
-++
- diff --ruN a/stablehlo/stablehlo/tests/transforms/stablehlo_target_independent_optimization.mlir b/stablehlo/stablehlo/tests/transforms/stablehlo_target_independent_optimization.mlir
- --- stablehlo/stablehlo/tests/transforms/stablehlo_target_independent_optimization.mlir
- +++ stablehlo/stablehlo/tests/transforms/stablehlo_target_independent_optimization.mlir
-@@ -373,6 +556,85 @@ diff --ruN a/stablehlo/stablehlo/tests/transforms/stablehlo_target_independent_o
-      stablehlo.return %1 : tensor<i1>
-    } do {
-      %1 = stablehlo.custom_call @something(%iterArg) {has_side_effect = false} : (tensor<i64>) -> tensor<i64>
-+diff --ruN a/stablehlo/stablehlo/transforms/StablehloCompatibilityExpander.cpp b/stablehlo/stablehlo/transforms/StablehloCompatibilityExpander.cpp
-+--- stablehlo/stablehlo/transforms/StablehloCompatibilityExpander.cpp
-++++ stablehlo/stablehlo/transforms/StablehloCompatibilityExpander.cpp
-+@@ -477,6 +477,13 @@
-+   // StableHLO RGV3 (replica_group_mesh_axes) is introduced in v1.16.0 or later.
-+   if (targetVersion < vhlo::Version(1, 16, 0))
-+     patterns->add<ReplicaGroupMeshAxesExpander>(context);
-++
-++  // StableHLO Exp2Op and Log2Op are introduced in v1.23.0.
-++  if (targetVersion < vhlo::Version(1, 23, 0))
-++    patterns->add<Exp2Op_ComplexElementType_CompatibilityExpander,
-++                  Exp2Op_CompatibilityExpander,
-++                  Log2Op_ComplexElementType_CompatibilityExpander,
-++                  Log2Op_CompatibilityExpander>(context);
-+ }
-+ 
-+ }  // namespace stablehlo
-+diff --ruN a/stablehlo/stablehlo/transforms/StablehloCompatibilityExpanderPatterns.td b/stablehlo/stablehlo/transforms/StablehloCompatibilityExpanderPatterns.td
-+--- stablehlo/stablehlo/transforms/StablehloCompatibilityExpanderPatterns.td
-++++ stablehlo/stablehlo/transforms/StablehloCompatibilityExpanderPatterns.td
-+@@ -20,6 +20,10 @@
-+   CPred<"isa<ComplexType>(cast<ShapedType>($_self).getElementType())">,
-+   "Complex element type">;
-+ 
-++def FloatElementType : Type<
-++  CPred<"isa<FloatType>(cast<ShapedType>($_self).getElementType())">,
-++  "Float element type">;
-++
-+ def NonComplexElementType : Type<
-+   CPred<"!isa<ComplexType>(cast<ShapedType>($_self).getElementType())">,
-+   "Non-complex element type">;
-+@@ -49,3 +53,47 @@
-+       (StableHLO_ConstantLike<"1.0"> $tan),
-+       (StableHLO_NegOp (StableHLO_MulOp $tan, $tanh)))
-+   )>;
-++
-++// Express `exp2` as
-++//   exponential(x * ln(2))
-++def Exp2Op_CompatibilityExpander : Pat<
-++  (StableHLO_Exp2Op FloatElementType:$input, ConstDefaultResultAccuracyAttr),
-++  (StableHLO_ExpOp
-++    (StableHLO_MulOp
-++      $input,
-++      (StableHLO_ConstantLike<"llvm::numbers::ln2"> $input)),
-++    ConstDefaultResultAccuracyAttr)>;
-++
-++// Express `exp2(a + bi)` as
-++//   exponential((a * ln(2)) + i (b * ln(2)))
-++def Exp2Op_ComplexElementType_CompatibilityExpander : Pat<
-++  (StableHLO_Exp2Op ComplexElementType:$input, ConstDefaultResultAccuracyAttr),
-++  (StableHLO_ExpOp
-++    (StableHLO_ComplexOp
-++      (StableHLO_MulOp
-++        (StableHLO_RealOp:$real $input),
-++        (StableHLO_ConstantLike<"llvm::numbers::ln2">:$ln2 $real)),
-++      (StableHLO_MulOp
-++        (StableHLO_ImagOp $input),
-++        $ln2)),
-++    ConstDefaultResultAccuracyAttr)>;
-++
-++// Express `log2` as
-++//   log(x) / ln(2)
-++def Log2Op_CompatibilityExpander : Pat<
-++  (StableHLO_Log2Op FloatElementType:$input, ConstDefaultResultAccuracyAttr),
-++  (StableHLO_DivOp
-++    (StableHLO_LogOp $input, ConstDefaultResultAccuracyAttr),
-++    (StableHLO_ConstantLike<"llvm::numbers::ln2"> $input))>;
-++
-++// Express `log2(a + bi)` as
-++//   (real(log(a + bi)) / ln(2)) + i (imag(log(a + bi)) / ln(2))
-++def Log2Op_ComplexElementType_CompatibilityExpander : Pat<
-++  (StableHLO_Log2Op ComplexElementType:$input, ConstDefaultResultAccuracyAttr),
-++  (StableHLO_ComplexOp
-++    (StableHLO_DivOp
-++      (StableHLO_RealOp:$real (StableHLO_LogOp:$log $input, ConstDefaultResultAccuracyAttr)),
-++      (StableHLO_ConstantLike<"llvm::numbers::ln2">:$ln2 $real)),
-++    (StableHLO_DivOp
-++      (StableHLO_ImagOp $log),
-++      $ln2))>;
- diff --ruN a/stablehlo/stablehlo/transforms/optimization/StablehloAggressiveSimplification.cpp b/stablehlo/stablehlo/transforms/optimization/StablehloAggressiveSimplification.cpp
- --- stablehlo/stablehlo/transforms/optimization/StablehloAggressiveSimplification.cpp
- +++ stablehlo/stablehlo/transforms/optimization/StablehloAggressiveSimplification.cpp
